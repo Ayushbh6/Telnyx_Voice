@@ -88,11 +88,11 @@ async def media_stream(websocket: WebSocket):
 
         def on_open(ws):
             print("Connected to OpenAI WebSocket")
-            # Send initial configuration
+            # Send initial configuration with correct modalities
             event = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text", "speech"],
+                    "modalities": ["text", "audio"],
                     "instructions": SYSTEM_MESSAGE
                 }
             }
