@@ -42,9 +42,13 @@ class RealtimeSession:
             "voice": VOICE,
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {
+                "type": "server_vad",
+                "mode": "client_triggered"
+            },
             "temperature": 0.7
         }
+        self.is_speaking = False
 
     async def connect_to_openai(self):
         """Establish connection to OpenAI's Realtime API"""
@@ -136,12 +140,19 @@ class RealtimeSession:
             if event_type == "media":
                 # Forward audio data to OpenAI
                 if self.openai_ws and not self.openai_ws.closed:
-                    await self.send_openai_event(message)
-                    # Create new response after receiving user audio
-                    await self.send_openai_event({"type": "response.create"})
+                    # Only send the audio data
+                    await self.send_openai_event({
+                        "type": "input_audio_buffer.append",
+                        "audio": message["media"]["payload"]
+                    })
+                    # We'll create a new response only after getting speech_stopped event
                 else:
                     logger.warning("OpenAI connection lost, reconnecting...")
                     await self.connect_to_openai()
+            elif event_type == "speech.ended":
+                # When speech ends, commit the buffer and create a new response
+                await self.send_openai_event({"type": "input_audio_buffer.commit"})
+                await self.send_openai_event({"type": "response.create"})
             elif event_type == "start":
                 logger.info(f"Stream started: {message.get('stream_id')}")
             else:
