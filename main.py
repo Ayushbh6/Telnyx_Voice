@@ -168,7 +168,6 @@ async def media_stream(websocket: WebSocket):
                         "instructions": SYSTEM_MESSAGE,
                         "modalities": ["text", "audio"],
                         "temperature": 0.8,
-                        "max_tokens": 300
                     }
                 }
                 print("Sending session update:", json.dumps(session_update))
