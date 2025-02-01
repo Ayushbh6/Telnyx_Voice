@@ -4,7 +4,7 @@ import json
 import time
 import threading
 
-import websockets
+import websocket
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,8 +80,8 @@ async def media_stream(websocket: WebSocket):
     print("Client connected")
     
     try:
-        # Create WebSocket connection to OpenAI
-        openai_ws = websockets.WebSocketApp(
+        # Create WebSocket connection to OpenAI using websocket-client
+        openai_ws = websocket.WebSocketApp(
             'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
             header=[
                 f"Authorization: Bearer {OPENAI_API_KEY}",
