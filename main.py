@@ -103,7 +103,6 @@ class RealtimeSession:
                     # Aggregate transcript deltas.
                     delta_text = response.get("delta", "")
                     self.current_ai_transcript += delta_text
-                    # Optionally forward transcript deltas to the client
                     await self.client_ws.send_json({
                         "event": "transcript_delta",
                         "text": delta_text
@@ -130,15 +129,18 @@ class RealtimeSession:
                 elif event_type == "response.done":
                     # Turn completed — notify the client so that a new turn can start.
                     await self.client_ws.send_json({"event": "turn_done"})
-                    logger.debug("Turn completed.")
+                    logger.info("Turn completed, ready for next interaction")
+                    # Don't break here - let the connection close naturally and reconnect
                 elif event_type == "error":
                     logger.error(f"OpenAI error: {response}")
                 else:
                     logger.debug(f"Received OpenAI event: {event_type}")
                     
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("OpenAI connection closed normally, ready for next turn")
         except Exception as e:
             logger.error(f"Error handling OpenAI response: {e}")
-            raise
+            # Don't raise here - let the main loop handle reconnection
 
     async def handle_client_message(self, message: Dict[str, Any]):
         """Process incoming messages from the Telnyx client."""
@@ -199,28 +201,32 @@ async def media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
     
-    # Create a session using the WebSocket connection.
     session = RealtimeSession(websocket)
     openai_response_task = None
 
     try:
         while True:
-            # Ensure a live OpenAI connection—or else reconnect, preserving conversation context.
+            # If there's no active OpenAI connection or it's closed, reconnect
             if not session.openai_ws or session.openai_ws.closed:
+                logger.info("Establishing/re-establishing OpenAI connection...")
                 await session.connect_to_openai()
+                if openai_response_task:
+                    openai_response_task.cancel()
                 openai_response_task = asyncio.create_task(session.handle_openai_response())
             
-            # Wait for a message from the Telnyx client.
+            # Wait for a message from the Telnyx client
             try:
                 data = await websocket.receive_text()
-            except Exception as e:
-                logger.error(f"Error receiving message from client: {e}")
+                message = json.loads(data)
+                await session.handle_client_message(message)
+            except WebSocketDisconnect:
+                logger.info("Client disconnected")
                 break
-
-            message = json.loads(data)
-            await session.handle_client_message(message)
-    except WebSocketDisconnect:
-        logger.info("Client disconnected")
+            except Exception as e:
+                logger.error(f"Error processing client message: {e}")
+                # Don't break here - continue listening for more messages
+                continue
+                
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
