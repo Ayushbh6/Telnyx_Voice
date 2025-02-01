@@ -5,6 +5,6 @@
     <Pause length="1"/>
     <Say voice="Polly.Joanna">O.K. you can start talking!</Say>
     <Connect>
-        <Stream url="wss://7d9a-83-64-146-54.ngrok-free.app/media-stream" bidirectionalMode="rtp" />
+        <Stream url="wss://telnyxvoice-production.up.railway.app/media-stream" bidirectionalMode="rtp" />
     </Connect>
 </Response>
