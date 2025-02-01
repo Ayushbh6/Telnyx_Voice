@@ -92,14 +92,23 @@ class RealtimeSession:
                                 "payload": response["delta"]
                             }
                         })
+                elif event_type == "response.done":
+                    # Instead of closing, prepare for next interaction
+                    logger.debug("Response complete, ready for next interaction")
+                    # Don't send a new response.create here - wait for next user input
                 elif event_type == "error":
                     logger.error(f"OpenAI error: {response}")
                 else:
                     logger.debug(f"Received OpenAI event: {event_type}")
                     
+        except websockets.ConnectionClosed:
+            logger.info("OpenAI connection closed, attempting to reconnect...")
+            await self.connect_to_openai()
         except Exception as e:
             logger.error(f"Error handling OpenAI response: {e}")
-            raise
+            if not self.openai_ws.closed:
+                await self.openai_ws.close()
+            await self.connect_to_openai()
 
     async def handle_client_message(self, message: Dict[str, Any]):
         """Handle messages from Telnyx client"""
@@ -108,8 +117,12 @@ class RealtimeSession:
         if event_type == "media":
             # Forward audio data to OpenAI
             await self.send_openai_event(message)
+            # Create new response after receiving user audio
+            await self.send_openai_event({"type": "response.create"})
         elif event_type == "start":
             logger.info(f"Stream started: {message.get('stream_id')}")
+            # Send initial response.create to start conversation
+            await self.send_openai_event({"type": "response.create"})
         else:
             logger.debug(f"Received client event: {event_type}")
 
