@@ -49,6 +49,23 @@ async def get_ai_response(user_input: str) -> str:
         return "I apologize, but I'm having trouble processing your request right now."
 
 # TeXML Templates
+INITIAL_TEXML = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Answer/>
+    <Say voice="female">Hello! I'm your AI assistant. How can I help you today?</Say>
+    <Start>
+        <Transcription 
+            language="en" 
+            interimResults="true" 
+            transcriptionEngine="A"
+            transcriptionCallback="/transcribe" 
+            transcriptionCallbackMethod="POST"
+            transcriptionTracks="inbound"
+        />
+    </Start>
+    <Pause length="300"/>
+</Response>"""
+
 RESPONSE_TEXML = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="female">{response_text}</Say>
@@ -70,6 +87,12 @@ ERROR_TEXML = """<?xml version="1.0" encoding="UTF-8"?>
     <Say voice="female">I'm sorry, but I encountered an error. Please try again later.</Say>
     <Hangup/>
 </Response>"""
+
+@app.post("/inbound")
+async def incoming_call(request: Request):
+    """Handle incoming calls with initial greeting and start transcription."""
+    logger.info("Incoming call received")
+    return PlainTextResponse(content=INITIAL_TEXML, media_type="text/xml")
 
 @app.post("/transcribe")
 async def handle_transcription(request: Request):
