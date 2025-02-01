@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Answer/>
-    <Say voice="Polly.Joanna">Please wait while we connect your call to the A. I. voice assistant.</Say>
-    <Pause length="1"/>
-    <Connect>
-        <Stream url="wss://telnyxvoice-production.up.railway.app/media-stream" bidirectionalMode="rtp" />
-    </Connect>
+    <Gather input="speech" timeout="5" speechTimeout="2" action="/transcribe" method="POST">
+        <Say voice="female">Hello! I'm your AI assistant. How can I help you today?</Say>
+    </Gather>
 </Response>
