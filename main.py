@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import json
@@ -78,7 +79,8 @@ async def incoming_call(request: Request):
 async def media_stream(fastapi_ws: WebSocket):
     await fastapi_ws.accept()
     print("Client connected")
-    
+    openai_ws = None # Define openai_ws in the outer scope
+
     try:
         # Create WebSocket connection to OpenAI using websocket-client
         openai_ws = websocket_client.WebSocketApp(
@@ -87,7 +89,7 @@ async def media_stream(fastapi_ws: WebSocket):
                 f"Authorization: Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta: realtime=v1"
             ],
-            on_message=lambda ws, msg: handle_openai_message(ws, msg, fastapi_ws),
+            on_message=lambda ws, msg: asyncio.run(handle_openai_message(ws, msg, fastapi_ws)), # Run handle_openai_message as asyncio task
             on_error=lambda ws, err: print(f"OpenAI WebSocket error: {err}"),
             on_close=lambda ws: print("OpenAI WebSocket connection closed"),
             on_open=lambda ws: handle_openai_connect(ws)
@@ -113,7 +115,7 @@ async def media_stream(fastapi_ws: WebSocket):
                         "media": {
                             "payload": response["delta"],
                             "timestamp": int(time.time() * 1000),
-                            "encoding": "L16",
+                            "encoding": "L16", # Keep as L16 as per current logic, can convert to g711 if needed.
                             "channels": 1,
                             "rate": 16000
                         }
@@ -147,13 +149,18 @@ async def media_stream(fastapi_ws: WebSocket):
                     message = json.loads(data)
                     event_type = message.get("event")
                     if event_type == "media":
-                        if not openai_ws.sock.closed:
+                        if openai_ws and openai_ws.sock and openai_ws.sock.connected: # Check if openai_ws is initialized and connected
                             openai_ws.send(json.dumps(message))
+                        else:
+                            print("OpenAI WebSocket not connected, cannot send media.")
                     elif event_type == "start":
                         stream_sid = message["stream_id"]
                         print(f"Incoming stream has started: {stream_sid}")
                     else:
                         print(f"Received non-media event: {event_type}")
+                except WebSocketDisconnect:
+                    print("Telnyx client disconnected.")
+                    break # Exit the loop when Telnyx client disconnects
                 except Exception as e:
                     print(f"Error in receive_telnyx_messages: {e}")
                     break
@@ -165,6 +172,11 @@ async def media_stream(fastapi_ws: WebSocket):
         print("Client disconnected")
     except Exception as e:
         print("WebSocket error:", e)
+    finally:
+        if openai_ws:
+            openai_ws.close() # Ensure OpenAI WebSocket is closed when client disconnects or errors occur.
+            print("OpenAI WebSocket closed due to client disconnect or error.")
+
 
 # Start the FastAPI server
 if __name__ == "__main__":
