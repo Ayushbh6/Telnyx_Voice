@@ -114,7 +114,7 @@ async def media_stream(fastapi_ws: WebSocket):
             "OpenAI-Beta": "realtime=v1"
         }
         try:
-            async with websockets.connect(uri, extra_headers=headers) as openai_ws:
+            async with websockets.connect(uri, header=headers) as openai_ws:
                 print("OpenAI WebSocket connected")
                 session_update = {
                     "type": "session.update",
