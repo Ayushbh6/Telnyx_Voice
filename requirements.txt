@@ -2,5 +2,4 @@ fastapi
 python-dotenv
 uvicorn[standard]
 websocket-client
-websockets>=10.0
 openai
