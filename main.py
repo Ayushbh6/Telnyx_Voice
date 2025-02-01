@@ -18,10 +18,73 @@ if not OPENAI_API_KEY:
     print('Missing OpenAI API key. Please set it in the .env file.')
     exit(1)
 
+AI_by_DNA = """We empower organizations with Agentic AI
+AI by DNA is an Artificial Intelligence transformation
+agency that supports ambitious organizations to scale
+their AI and Data capabilities, augmenting efficiency,
+performance and growth.
+We are your trusted partner to guide your AI transformation. We are neutral and will
+compose the best solution to your needs. If it does not exist, we will build it for you.
+Conversational Agent
+Pharmaceutical Care
+“AI by DNA has revolutionized our pictograms' way of communicating information to
+patients, by transforming it to a natural language conversation experience for them!!!”
+Sophia Demagou (Piktocare | GET2WORK)
+Conversational Agents
+Conversations are the new markets. AI-driven Conversational agents provide personalized,
+real-time and in-depth interaction.
+Unveil new AI by Chat opportunities: AI by Chat With reactively support and anytime recommend your product & services . you can proactively promote,
+Gain and retain
+customers.
+Unlock the power of AI by Phone: Human-like AI Voice Assistants are radically changing
+the way businesses use their phone lines. Improve productivity, efficiency and customer
+satisfaction.
+Scale your potential with AI by Clone: Such a video-based agent, showcasing a human-like
+avatar, converse with people inside a specific knowledge context, via audio and in multiple
+languages. Transform your customers' experience.
+Knowledge Assistants
+In the fast-paced environment of today, quick access to accurate information and reliable
+action taking are key to enhance efficiency.
+Unique Internal Data Retrieval Focus: AI by DNA assistants focus on internal information
+retrieval, tapping seamlessly into complex sources, to generate your own knowledge based
+search engines.
+This means secure. procedures etc.
+streamlined information and work flows, i.e. more accurate, efficient and
+Improve efficiency on regulatory & compliance, inventory management, operating
+Decision Engines
+Data Processing & Predictive Analytics for Insightful Solutions: drives innovation, AI by DNA insights from complex data sets. efficiency.
+In an era where data
+data analysis capabilities empower you to derive actionable
+Enhance decision-making, operational and commercial
+Real-time data driven decision making: AI by DNA insights that help real-time resource allocation tools set delivers evidence-based
+optimization, comprehensive revenue management,
+dynamic pricing.
+"Looking to harness the power of advanced language models with a foundation in data-
+driven insights? Need a custom agent with predictive analytics, retrieval capabilities,
+and seamless integration with vector stores and other tools? We are here to design,
+develop, and deploy tailor-made solutions that meet your specific business objectives.
+Let us turn your data and context into actionable intelligence."
+George Kotzamanis, Co-Founder | Chief Operating Officer
+Get in touch with "AI by DNA" today.
+“We live at a time of massive tech disruption in almost all areas of work and life. We were
+getting prepared for this, we are working on it, but now is the time to focus on what we might
+accomplish for you.” - Kostas Varsamos, Co-Founder | CEO
+Offices: Greece (Athens) | Germany (Frankfurt) - Email: contact@aibydna.com
+"""
+
 # Constants
-SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts.'
+SYSTEM_MESSAGE = f"""
+You are the personla call centre agent for AI by DNA.
+Here is complete information about AI by DNA:
+{AI_by_DNA}
+
+User task is to engage actively with the client and help them to understand the services offered by AI by DNA.
+Be friendly and helpful.
+You are proficient in English and Greek.
+Use English as the default language.
+"""
 VOICE = 'alloy'
-PORT = int(os.getenv('PORT', 8000))  # Allow dynamic port assignment
+PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
 
 # List of Event Types to log to the console. See OpenAI Realtime API Documentation.
 LOG_EVENT_TYPES = [
@@ -79,7 +142,7 @@ async def media_stream(websocket: WebSocket):
     
     try:
         async with websockets.connect(
-                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
                 extra_headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "OpenAI-Beta": "realtime=v1"
