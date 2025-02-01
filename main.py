@@ -24,7 +24,10 @@ if not OPENAI_API_KEY:
     exit(1)
 
 # Constants
-SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts.'
+SYSTEM_MESSAGE = (
+    'You are a helpful and bubbly AI assistant who loves to chat about anything '
+    'the user is interested about and is prepared to offer them facts.'
+)
 VOICE = 'alloy'
 PORT = int(os.getenv('PORT', 8080))
 
@@ -33,8 +36,13 @@ class RealtimeSession:
         self.client_ws = websocket
         self.openai_ws = None
         self.audio_buffer = b''
+        # Used to accumulate transcript deltas from OpenAI
+        self.current_ai_transcript = ""
+        # Maintain conversation history with messages of the form:
+        # { "role": "user"|"assistant", "content": "..." }
+        self.conversation_history = []
         
-        # Session configuration
+        # Session configuration (this is sent on connection/reconnection)
         self.session_config = {
             "modalities": ["audio", "text"],
             "instructions": SYSTEM_MESSAGE,
@@ -46,7 +54,7 @@ class RealtimeSession:
         }
 
     async def connect_to_openai(self):
-        """Establish connection to OpenAI's Realtime API"""
+        """Establish connection to OpenAI's Realtime API and configure the session, including conversation history."""
         try:
             self.openai_ws = await websockets.connect(
                 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
@@ -57,13 +65,18 @@ class RealtimeSession:
             )
             logger.info("Connected to OpenAI Realtime API")
             
-            # Configure session
+            # Merge conversation history into the session config if available.
+            session_payload = self.session_config.copy()
+            if self.conversation_history:
+                session_payload["history"] = self.conversation_history
+            
+            # Update session configuration with instructions and context
             await self.send_openai_event({
                 "type": "session.update",
-                "session": self.session_config
+                "session": session_payload
             })
             
-            # Initialize conversation
+            # Start a new conversation turn.
             await self.send_openai_event({"type": "response.create"})
             
         except Exception as e:
@@ -71,20 +84,42 @@ class RealtimeSession:
             raise
 
     async def send_openai_event(self, event: Dict[str, Any]):
-        """Send event to OpenAI"""
+        """Send event to OpenAI; if the connection is closed then reconnect automatically."""
+        if not self.openai_ws or self.openai_ws.closed:
+            logger.info("OpenAI websocket is closed, reconnecting...")
+            await self.connect_to_openai()
         if self.openai_ws:
             await self.openai_ws.send(json.dumps(event))
-            logger.debug(f"Sent event to OpenAI: {event['type']}")
+            logger.debug(f"Sent event to OpenAI: {event.get('type')}")
 
     async def handle_openai_response(self):
-        """Handle messages from OpenAI"""
+        """Handle and forward OpenAI responses, as well as update conversation history."""
         try:
             async for message in self.openai_ws:
                 response = json.loads(message)
                 event_type = response.get("type")
                 
-                if event_type == "response.audio.delta":
-                    # Send audio chunks directly to Telnyx client
+                if event_type.startswith("response.audio_transcript.delta"):
+                    # Aggregate transcript deltas.
+                    delta_text = response.get("delta", "")
+                    self.current_ai_transcript += delta_text
+                    # Optionally forward transcript deltas to the client
+                    await self.client_ws.send_json({
+                        "event": "transcript_delta",
+                        "text": delta_text
+                    })
+                elif event_type == "response.audio_transcript.done":
+                    # When transcript is complete, add it to conversation history.
+                    final_transcript = self.current_ai_transcript
+                    self.current_ai_transcript = ""  # Reset for next turn.
+                    if final_transcript.strip():
+                        self.conversation_history.append({"role": "assistant", "content": final_transcript})
+                    await self.client_ws.send_json({
+                        "event": "transcript_done",
+                        "text": final_transcript
+                    })
+                elif event_type == "response.audio.delta":
+                    # Forward audio chunks directly to Telnyx client.
                     if response.get("delta"):
                         await self.client_ws.send_json({
                             "event": "media",
@@ -92,6 +127,10 @@ class RealtimeSession:
                                 "payload": response["delta"]
                             }
                         })
+                elif event_type == "response.done":
+                    # Turn completed — notify the client so that a new turn can start.
+                    await self.client_ws.send_json({"event": "turn_done"})
+                    logger.debug("Turn completed.")
                 elif event_type == "error":
                     logger.error(f"OpenAI error: {response}")
                 else:
@@ -102,14 +141,23 @@ class RealtimeSession:
             raise
 
     async def handle_client_message(self, message: Dict[str, Any]):
-        """Handle messages from Telnyx client"""
+        """Process incoming messages from the Telnyx client."""
         event_type = message.get("event")
         
         if event_type == "media":
-            # Forward audio data to OpenAI
+            # Forward audio data to OpenAI.
             await self.send_openai_event(message)
         elif event_type == "start":
             logger.info(f"Stream started: {message.get('stream_id')}")
+            # You may want to set up per-turn state here. For example, you could clear
+            # any pending user transcript, if implementing client-side ASR.
+        elif event_type == "user.text":
+            # Optionally handle text from the user (if provided) and add to conversation history.
+            # This is useful if the client sends a text message alongside or instead of audio.
+            user_text = message.get("text", "")
+            if user_text.strip():
+                self.conversation_history.append({"role": "user", "content": user_text})
+            await self.send_openai_event(message)
         else:
             logger.debug(f"Received client event: {event_type}")
 
@@ -151,35 +199,34 @@ async def media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
     
+    # Create a session using the WebSocket connection.
     session = RealtimeSession(websocket)
-    
-    try:
-        # Connect to OpenAI
-        await session.connect_to_openai()
-        
-        # Handle messages concurrently
-        async def receive_client_messages():
-            while True:
-                try:
-                    data = await websocket.receive_text()
-                    message = json.loads(data)
-                    await session.handle_client_message(message)
-                except Exception as e:
-                    logger.error(f"Error receiving client message: {e}")
-                    break
+    openai_response_task = None
 
-        # Run both handlers concurrently
-        await asyncio.gather(
-            session.handle_openai_response(),
-            receive_client_messages()
-        )
-        
+    try:
+        while True:
+            # Ensure a live OpenAI connection—or else reconnect, preserving conversation context.
+            if not session.openai_ws or session.openai_ws.closed:
+                await session.connect_to_openai()
+                openai_response_task = asyncio.create_task(session.handle_openai_response())
+            
+            # Wait for a message from the Telnyx client.
+            try:
+                data = await websocket.receive_text()
+            except Exception as e:
+                logger.error(f"Error receiving message from client: {e}")
+                break
+
+            message = json.loads(data)
+            await session.handle_client_message(message)
     except WebSocketDisconnect:
         logger.info("Client disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        if session.openai_ws:
+        if openai_response_task:
+            openai_response_task.cancel()
+        if session.openai_ws and not session.openai_ws.closed:
             await session.openai_ws.close()
 
 if __name__ == "__main__":
