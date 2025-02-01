@@ -82,6 +82,8 @@ User task is to engage actively with the client and help them to understand the 
 Be friendly and helpful.
 You are proficient in English and Greek.
 Use English as the default language.
+
+IMPORTANT: Keep your answers to maximum 100 words.
 """
 VOICE = 'alloy'
 PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
@@ -155,10 +157,11 @@ async def media_stream(websocket: WebSocket):
                     "session": {
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": True  # Add this to auto-create responses
+                            "threshold": 0.3,  # Lower threshold for quicker speech detection
+                            "prefix_padding_ms": 150,  # Reduced from 300
+                            "silence_duration_ms": 400,  # Reduced from 600
+                            "create_response": True,
+                            "interrupt_on_input": True  # Enable interruption
                         },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
@@ -166,6 +169,7 @@ async def media_stream(websocket: WebSocket):
                         "instructions": SYSTEM_MESSAGE,
                         "modalities": ["text", "audio"],
                         "temperature": 0.8,
+                        "max_tokens": 300
                     }
                 }
                 print("Sending session update:", json.dumps(session_update))
