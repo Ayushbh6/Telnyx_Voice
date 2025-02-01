@@ -103,18 +103,20 @@ async def media_stream(websocket: WebSocket):
                 response = json.loads(message)
                 print(f"Received OpenAI event:", json.dumps(response, indent=2))
                 
-                # Handle audio responses
-                if response.get("type") == "response.content_part.added":
-                    if response.get("part", {}).get("type") == "audio":
-                        print("Audio content received, forwarding to Telnyx")
-                        audio_delta = {
-                            "event": "media",
-                            "media": {
-                                "payload": response.get("part", {}).get("data", "")
-                            }
-                        }
-                        asyncio.run(websocket.send_json(audio_delta))
-                
+                # Handle text transcript and audio responses
+                if response.get("type") == "response.output.done":
+                    for item in response.get("output", []):
+                        if item.get("content"):
+                            for content in item["content"]:
+                                if content.get("type") == "audio" and content.get("data"):
+                                    audio_delta = {
+                                        "event": "media",
+                                        "media": {
+                                            "payload": content["data"]
+                                        }
+                                    }
+                                    asyncio.run(websocket.send_json(audio_delta))
+
                 # Keep existing audio.delta handling for backward compatibility
                 elif response.get("type") == "response.audio.delta" and response.get("delta"):
                     audio_delta = {
@@ -148,16 +150,17 @@ async def media_stream(websocket: WebSocket):
                     
                     if event_type == "media":
                         if openai_ws.sock and openai_ws.sock.connected:
-                            # Format the audio data for OpenAI
+                            # Send raw audio data directly
                             audio_event = {
                                 "type": "input_audio_buffer.append",
-                                "audio": {
-                                    "data": message["media"]["payload"]
-                                }
+                                "audio": message["media"]["payload"]  # Send raw audio bytes
                             }
                             openai_ws.send(json.dumps(audio_event))
                             
-                            # Send commit event after appending audio data
+                            # Accumulate more audio before committing
+                            # You might want to implement a buffer system here
+                            await asyncio.sleep(0.1)  # Wait for more audio
+                            
                             commit_event = {
                                 "type": "input_audio_buffer.commit"
                             }
