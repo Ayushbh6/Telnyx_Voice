@@ -147,19 +147,28 @@ class RealtimeSession:
         event_type = message.get("event")
         
         if event_type == "media":
-            # Forward audio data to OpenAI.
-            await self.send_openai_event(message)
+            # Forward audio data to OpenAI, but only if it contains media payload
+            if "media" in message and "payload" in message["media"]:
+                await self.send_openai_event({
+                    "type": "audio.data",
+                    "data": message["media"]["payload"]
+                })
         elif event_type == "start":
             logger.info(f"Stream started: {message.get('stream_id')}")
-            # You may want to set up per-turn state here. For example, you could clear
-            # any pending user transcript, if implementing client-side ASR.
+            # Initialize the turn when stream starts
+            await self.send_openai_event({"type": "response.create"})
+        elif event_type == "stop":
+            logger.info("Stream stopped")
+            # Optionally handle stream stop
+            pass
         elif event_type == "user.text":
-            # Optionally handle text from the user (if provided) and add to conversation history.
-            # This is useful if the client sends a text message alongside or instead of audio.
             user_text = message.get("text", "")
             if user_text.strip():
                 self.conversation_history.append({"role": "user", "content": user_text})
-            await self.send_openai_event(message)
+                await self.send_openai_event({
+                    "type": "text.data",
+                    "data": user_text
+                })
         else:
             logger.debug(f"Received client event: {event_type}")
 
