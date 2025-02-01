@@ -161,7 +161,6 @@ async def media_stream(websocket: WebSocket):
                             "prefix_padding_ms": 150,  # Reduced from 300
                             "silence_duration_ms": 400,  # Reduced from 600
                             "create_response": True,
-                            "interrupt_on_input": True  # Enable interruption
                         },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
