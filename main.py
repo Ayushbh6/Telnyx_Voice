@@ -85,7 +85,7 @@ async def media_stream(websocket: WebSocket):
         
         async with websockets.connect(
            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
-            **{openai_headers}
+            extra_headers=openai_headers
         ) as openai_ws:
         
 
