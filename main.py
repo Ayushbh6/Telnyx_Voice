@@ -21,7 +21,7 @@ if not OPENAI_API_KEY:
 # Constants
 SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts.'
 VOICE = 'alloy'
-PORT = int(os.getenv('PORT', 8000))  # Allow dynamic port assignment
+PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
 
 # List of Event Types to log to the console. See OpenAI Realtime API Documentation.
 LOG_EVENT_TYPES = [
@@ -78,13 +78,15 @@ async def media_stream(websocket: WebSocket):
     print("Client connected")
     
     try:
+        openai_headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1"
+        }
         async with websockets.connect(
-                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-                extra_headers=[
-                    ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-                    ("OpenAI-Beta", "realtime=v1")
-                ]
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            headers=openai_headers
         ) as openai_ws:
+
 
             async def send_session_update():
                 session_update = {
