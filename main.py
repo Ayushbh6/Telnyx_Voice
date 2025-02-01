@@ -91,8 +91,8 @@ async def media_stream(websocket: WebSocket):
                     "type": "session.update",
                     "session": {
                         "turn_detection": {"type": "server_vad"},
-                        "input_audio_format": "g711_ulaw",
-                        "output_audio_format": "g711_ulaw",
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
                         "voice": VOICE,
                         "instructions": SYSTEM_MESSAGE,
                         "modalities": ["text", "audio"],
@@ -127,17 +127,23 @@ async def media_stream(websocket: WebSocket):
 
             async def receive_telnyx_messages():
                 while True:
-                    data = await websocket.receive_text()
-                    message = json.loads(data)
-                    event_type = message.get("event")
-                    if event_type == "media":
-                        if openai_ws.open:
-                            await openai_ws.send(json.dumps(message))
-                    elif event_type == "start":
-                        stream_sid = message["stream_id"]
-                        print(f"Incoming stream has started: {stream_sid}")
-                    else:
-                        print(f"Received non-media event: {event_type}")
+                    try:
+                        data = await websocket.receive_text()
+                        message = json.loads(data)
+                        event_type = message.get("event")
+                        if event_type == "media":
+                            if openai_ws.open:
+                                print("Sending media to OpenAI")  # Debug log
+                                await openai_ws.send(json.dumps(message))
+                            else:
+                                print("OpenAI WebSocket is closed")  # Debug log
+                        elif event_type == "start":
+                            stream_sid = message["stream_id"]
+                            print(f"Incoming stream has started: {stream_sid}")
+                        else:
+                            print(f"Received non-media event: {event_type}", message)  # Added message content
+                    except Exception as e:
+                        print(f"Error in receive_telnyx_messages: {e}")  # Added error handling
 
             # Run OpenAI and Telnyx message receivers concurrently
             await asyncio.gather(receive_openai_messages(), receive_telnyx_messages())
