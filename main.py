@@ -83,7 +83,7 @@ Be friendly and helpful.
 You are proficient in English and Greek.
 Use English as the default language.
 
-IMPORTANT: Keep your answers to maximum 100 words.
+IMPORTANT: Keep your answers to maximum 5 lines of text.
 """
 VOICE = 'alloy'
 PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
@@ -155,19 +155,24 @@ async def media_stream(websocket: WebSocket):
                 session_update = {
                     "type": "session.update",
                     "session": {
+                        # Configure turn detection for VAD
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.5,
+                            "threshold": 0.5,  # Default threshold for speech detection
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 600,
-                            "create_response": True  # Add this to auto-create responses
+                            "create_response": True
+                        },
+                        # Enable response interruption at the session level
+                        "response_interruption": {
+                            "type": "auto"  # This is key for handling interruptions
                         },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
                         "voice": VOICE,
                         "instructions": SYSTEM_MESSAGE,
                         "modalities": ["text", "audio"],
-                        "temperature": 0.8,
+                        "temperature": 0.8
                     }
                 }
                 print("Sending session update:", json.dumps(session_update))
