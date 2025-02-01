@@ -82,11 +82,12 @@ async def media_stream(websocket: WebSocket):
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1"
         }
+        
         async with websockets.connect(
-            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
-            headers=openai_headers
+           'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            **{'open_connection': {'headers': openai_headers}}
         ) as openai_ws:
-
+        
 
             async def send_session_update():
                 session_update = {
