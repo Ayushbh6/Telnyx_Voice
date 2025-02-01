@@ -33,22 +33,17 @@ class RealtimeSession:
         self.client_ws = websocket
         self.openai_ws = None
         self.audio_buffer = b''
-        self.is_active = True
         
         # Session configuration
         self.session_config = {
             "modalities": ["audio", "text"],
             "instructions": SYSTEM_MESSAGE,
             "voice": VOICE,
-            "input_audio_format": "g711_ulaw",
+            "input_audio_format": "g711_ulaw",  # Telnyx uses g711_ulaw
             "output_audio_format": "g711_ulaw",
-            "turn_detection": {
-                "type": "server_vad",
-                "mode": "client_triggered"
-            },
+            "turn_detection": {"type": "server_vad"},
             "temperature": 0.7
         }
-        self.is_speaking = False
 
     async def connect_to_openai(self):
         """Establish connection to OpenAI's Realtime API"""
@@ -58,9 +53,7 @@ class RealtimeSession:
                 extra_headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "OpenAI-Beta": "realtime=v1"
-                },
-                ping_interval=20,  # Send ping every 20 seconds
-                ping_timeout=60    # Wait up to 60 seconds for pong
+                }
             )
             logger.info("Connected to OpenAI Realtime API")
             
@@ -79,92 +72,46 @@ class RealtimeSession:
 
     async def send_openai_event(self, event: Dict[str, Any]):
         """Send event to OpenAI"""
-        if self.openai_ws and not self.openai_ws.closed:
+        if self.openai_ws:
             await self.openai_ws.send(json.dumps(event))
             logger.debug(f"Sent event to OpenAI: {event['type']}")
-        else:
-            logger.warning("OpenAI WebSocket is closed, attempting to reconnect...")
-            await self.connect_to_openai()
-            await self.openai_ws.send(json.dumps(event))
-
-    async def heartbeat(self):
-        """Keep the connections alive with periodic messages"""
-        while self.is_active:
-            try:
-                if self.openai_ws and not self.openai_ws.closed:
-                    await self.send_openai_event({"type": "ping"})
-                await asyncio.sleep(30)  # Send heartbeat every 30 seconds
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-                await asyncio.sleep(5)  # Wait before retry
 
     async def handle_openai_response(self):
         """Handle messages from OpenAI"""
-        while self.is_active:
-            try:
-                async for message in self.openai_ws:
-                    response = json.loads(message)
-                    event_type = response.get("type")
+        try:
+            async for message in self.openai_ws:
+                response = json.loads(message)
+                event_type = response.get("type")
+                
+                if event_type == "response.audio.delta":
+                    # Send audio chunks directly to Telnyx client
+                    if response.get("delta"):
+                        await self.client_ws.send_json({
+                            "event": "media",
+                            "media": {
+                                "payload": response["delta"]
+                            }
+                        })
+                elif event_type == "error":
+                    logger.error(f"OpenAI error: {response}")
+                else:
+                    logger.debug(f"Received OpenAI event: {event_type}")
                     
-                    if event_type == "response.audio.delta":
-                        if response.get("delta"):
-                            await self.client_ws.send_json({
-                                "event": "media",
-                                "media": {
-                                    "payload": response["delta"]
-                                }
-                            })
-                    elif event_type == "response.done":
-                        logger.debug("Response complete, ready for next interaction")
-                    elif event_type == "error":
-                        logger.error(f"OpenAI error: {response}")
-                    else:
-                        logger.debug(f"Received OpenAI event: {event_type}")
-                        
-            except websockets.ConnectionClosed:
-                logger.info("OpenAI connection closed, attempting to reconnect...")
-                await asyncio.sleep(1)  # Wait before reconnecting
-                await self.connect_to_openai()
-            except Exception as e:
-                logger.error(f"Error handling OpenAI response: {e}")
-                await asyncio.sleep(1)
-                if self.openai_ws and not self.openai_ws.closed:
-                    await self.openai_ws.close()
-                await self.connect_to_openai()
+        except Exception as e:
+            logger.error(f"Error handling OpenAI response: {e}")
+            raise
 
     async def handle_client_message(self, message: Dict[str, Any]):
         """Handle messages from Telnyx client"""
-        try:
-            event_type = message.get("event")
-            
-            if event_type == "media":
-                # Forward audio data to OpenAI
-                if self.openai_ws and not self.openai_ws.closed:
-                    # Only send the audio data
-                    await self.send_openai_event({
-                        "type": "input_audio_buffer.append",
-                        "audio": message["media"]["payload"]
-                    })
-                    # We'll create a new response only after getting speech_stopped event
-                else:
-                    logger.warning("OpenAI connection lost, reconnecting...")
-                    await self.connect_to_openai()
-            elif event_type == "speech.ended":
-                # When speech ends, commit the buffer and create a new response
-                await self.send_openai_event({"type": "input_audio_buffer.commit"})
-                await self.send_openai_event({"type": "response.create"})
-            elif event_type == "start":
-                logger.info(f"Stream started: {message.get('stream_id')}")
-            else:
-                logger.debug(f"Received client event: {event_type}")
-        except Exception as e:
-            logger.error(f"Error handling client message: {e}")
-
-    async def cleanup(self):
-        """Clean up resources"""
-        self.is_active = False
-        if self.openai_ws and not self.openai_ws.closed:
-            await self.openai_ws.close()
+        event_type = message.get("event")
+        
+        if event_type == "media":
+            # Forward audio data to OpenAI
+            await self.send_openai_event(message)
+        elif event_type == "start":
+            logger.info(f"Stream started: {message.get('stream_id')}")
+        else:
+            logger.debug(f"Received client event: {event_type}")
 
 app = FastAPI()
 
@@ -210,36 +157,30 @@ async def media_stream(websocket: WebSocket):
         # Connect to OpenAI
         await session.connect_to_openai()
         
-        # Start heartbeat
-        heartbeat_task = asyncio.create_task(session.heartbeat())
-        
         # Handle messages concurrently
         async def receive_client_messages():
-            while session.is_active:
+            while True:
                 try:
                     data = await websocket.receive_text()
                     message = json.loads(data)
                     await session.handle_client_message(message)
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected")
-                    break
                 except Exception as e:
                     logger.error(f"Error receiving client message: {e}")
-                    await asyncio.sleep(1)  # Wait before retry
+                    break
 
-        # Run all handlers concurrently
+        # Run both handlers concurrently
         await asyncio.gather(
             session.handle_openai_response(),
-            receive_client_messages(),
-            return_exceptions=True
+            receive_client_messages()
         )
         
+    except WebSocketDisconnect:
+        logger.info("Client disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        heartbeat_task.cancel()
-        await session.cleanup()
-        logger.info("Session cleaned up")
+        if session.openai_ws:
+            await session.openai_ws.close()
 
 if __name__ == "__main__":
     import uvicorn
