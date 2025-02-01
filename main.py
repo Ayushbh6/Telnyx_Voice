@@ -4,7 +4,7 @@ import json
 import time
 import threading
 
-import websocket
+import websocket as websocket_client
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,19 +75,19 @@ async def incoming_call(request: Request):
 
 # WebSocket route for media-stream
 @app.websocket("/media-stream")
-async def media_stream(websocket: WebSocket):
-    await websocket.accept()
+async def media_stream(fastapi_ws: WebSocket):
+    await fastapi_ws.accept()
     print("Client connected")
     
     try:
         # Create WebSocket connection to OpenAI using websocket-client
-        openai_ws = websocket.WebSocketApp(
+        openai_ws = websocket_client.WebSocketApp(
             'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
             header=[
                 f"Authorization: Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta: realtime=v1"
             ],
-            on_message=lambda ws, msg: handle_openai_message(ws, msg, websocket),
+            on_message=lambda ws, msg: handle_openai_message(ws, msg, fastapi_ws),
             on_error=lambda ws, err: print(f"OpenAI WebSocket error: {err}"),
             on_close=lambda ws: print("OpenAI WebSocket connection closed"),
             on_open=lambda ws: handle_openai_connect(ws)
@@ -143,7 +143,7 @@ async def media_stream(websocket: WebSocket):
         async def receive_telnyx_messages():
             while True:
                 try:
-                    data = await websocket.receive_text()
+                    data = await fastapi_ws.receive_text()
                     message = json.loads(data)
                     event_type = message.get("event")
                     if event_type == "media":
