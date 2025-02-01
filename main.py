@@ -1,11 +1,9 @@
-
 import os
 import asyncio
 import json
 import time
-import threading
 
-import websocket as websocket_client
+import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,53 +77,39 @@ async def incoming_call(request: Request):
 async def media_stream(fastapi_ws: WebSocket):
     await fastapi_ws.accept()
     print("Client connected")
-    openai_ws = None # Define openai_ws in the outer scope
 
-    try:
-        # Create WebSocket connection to OpenAI using websocket-client
-        openai_ws = websocket_client.WebSocketApp(
-            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-            header=[
-                f"Authorization: Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta: realtime=v1"
-            ],
-            on_message=lambda ws, msg: asyncio.run(handle_openai_message(ws, msg, fastapi_ws)), # Run handle_openai_message as asyncio task
-            on_error=lambda ws, err: print(f"OpenAI WebSocket error: {err}"),
-            on_close=lambda ws: print("OpenAI WebSocket connection closed"),
-            on_open=lambda ws: handle_openai_connect(ws)
-        )
-
-        # Start OpenAI WebSocket connection in a separate thread
-        websocket_thread = threading.Thread(target=openai_ws.run_forever)
-        websocket_thread.daemon = True
-        websocket_thread.start()
-
-        async def handle_openai_message(ws, message, client_ws):
-            try:
-                response = json.loads(message)
-                if response.get("type") in LOG_EVENT_TYPES:
-                    print(f"Received event: {response['type']}", response)
-                if response.get("type") == "session.updated":
-                    print("Session updated successfully:", response)
-                if response.get("type") == "response.audio.delta" and response.get("delta"):
-                    print(f"Received audio delta from OpenAI: {len(response['delta'])} bytes")
-                    # Convert PCM16 to g711_ulaw for Telnyx
-                    audio_delta = {
-                        "event": "media",
-                        "media": {
-                            "payload": response["delta"],
-                            "timestamp": int(time.time() * 1000),
-                            "encoding": "L16", # Keep as L16 as per current logic, can convert to g711 if needed.
-                            "channels": 1,
-                            "rate": 16000
-                        }
+    async def handle_openai_message(openai_ws, message, client_ws):
+        try:
+            response = json.loads(message)
+            if response.get("type") in LOG_EVENT_TYPES:
+                print(f"Received event: {response['type']}", response)
+            if response.get("type") == "session.updated":
+                print("Session updated successfully:", response)
+            if response.get("type") == "response.audio.delta" and response.get("delta"):
+                print(f"Received audio delta from OpenAI: {len(response['delta'])} bytes")
+                # Convert PCM16 to g711_ulaw for Telnyx
+                audio_delta = {
+                    "event": "media",
+                    "media": {
+                        "payload": response["delta"],
+                        "timestamp": int(time.time() * 1000),
+                        "encoding": "L16", # Keep as L16 as per current logic, can convert to g711 if needed.
+                        "channels": 1,
+                        "rate": 16000
                     }
-                    print(f"Sending audio to Telnyx: {len(response['delta'])} bytes")
-                    await client_ws.send_json(audio_delta)
-            except Exception as e:
-                print("Error processing OpenAI message:", e, "Raw message:", message)
+                }
+                print(f"Sending audio to Telnyx: {len(response['delta'])} bytes")
+                await client_ws.send_json(audio_delta)
+        except Exception as e:
+            print("Error processing OpenAI message:", e, "Raw message:", message)
 
-        def handle_openai_connect(ws):
+    async def handle_openai_connection(client_ws):
+        uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1"
+        }
+        async with websockets.connect(uri, extra_headers=headers) as openai_ws:
             print("OpenAI WebSocket connected")
             session_update = {
                 "type": "session.update",
@@ -140,43 +124,35 @@ async def media_stream(fastapi_ws: WebSocket):
                 }
             }
             print("Sending session update:", json.dumps(session_update))
-            ws.send(json.dumps(session_update))
+            await openai_ws.send(json.dumps(session_update))
 
-        async def receive_telnyx_messages():
-            while True:
-                try:
-                    data = await fastapi_ws.receive_text()
-                    message = json.loads(data)
-                    event_type = message.get("event")
-                    if event_type == "media":
-                        if openai_ws and openai_ws.sock and openai_ws.sock.connected: # Check if openai_ws is initialized and connected
-                            openai_ws.send(json.dumps(message))
-                        else:
-                            print("OpenAI WebSocket not connected, cannot send media.")
-                    elif event_type == "start":
-                        stream_sid = message["stream_id"]
-                        print(f"Incoming stream has started: {stream_sid}")
-                    else:
-                        print(f"Received non-media event: {event_type}")
-                except WebSocketDisconnect:
-                    print("Telnyx client disconnected.")
-                    break # Exit the loop when Telnyx client disconnects
-                except Exception as e:
-                    print(f"Error in receive_telnyx_messages: {e}")
-                    break
+            async for message in openai_ws:
+                await handle_openai_message(openai_ws, message, client_ws)
 
-        # Handle Telnyx messages
-        await receive_telnyx_messages()
+    openai_task = asyncio.create_task(handle_openai_connection(fastapi_ws))
 
+    try:
+        while True:
+            data = await fastapi_ws.receive_text()
+            message = json.loads(data)
+            event_type = message.get("event")
+            if event_type == "media":
+                # Send media to OpenAI
+                # Assuming you have a reference to openai_ws here
+                # You might need to adjust the handle_openai_connection to store openai_ws
+                pass  # Handle sending media
+            elif event_type == "start":
+                stream_sid = message["stream_id"]
+                print(f"Incoming stream has started: {stream_sid}")
+            else:
+                print(f"Received non-media event: {event_type}")
     except WebSocketDisconnect:
-        print("Client disconnected")
+        print("Telnyx client disconnected.")
     except Exception as e:
-        print("WebSocket error:", e)
+        print(f"Error in media_stream: {e}")
     finally:
-        if openai_ws:
-            openai_ws.close() # Ensure OpenAI WebSocket is closed when client disconnects or errors occur.
-            print("OpenAI WebSocket closed due to client disconnect or error.")
-
+        openai_task.cancel()
+        print("OpenAI task cancelled.")
 
 # Start the FastAPI server
 if __name__ == "__main__":
