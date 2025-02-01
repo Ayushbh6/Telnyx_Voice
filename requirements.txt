@@ -1,5 +1,5 @@
-aider==0.2.6
-aider-chat==0.59.1
+aider
+aider-chat
 aiodns==3.2.0
 aiohappyeyeballs==2.4.0
 aiohttp==3.10.5
@@ -21,7 +21,7 @@ black==24.3.0
 bleach==6.1.0
 blinker==1.7.0
 boto3==1.34.72
-botocore==1.34.77
+botocore
 bs4==0.0.2
 build==1.2.1
 CacheControl==0.14.0
@@ -48,7 +48,7 @@ distlib==0.3.8
 distro==1.9.0
 docopt==0.6.2
 docutils==0.20.1
-dulwich==0.21.7
+dulwich
 executing==2.0.1
 fastapi==0.110.1
 fastjsonschema==2.19.1
@@ -90,7 +90,7 @@ jupyter_client==8.6.1
 jupyter_core==5.7.2
 jupyterlab_pygments==0.3.0
 keyring==25.1.0
-kinde-python-sdk==1.2.3
+kinde-python-sdk
 litellm==1.47.0
 markdown-it-py==3.0.0
 MarkupSafe==2.1.5
