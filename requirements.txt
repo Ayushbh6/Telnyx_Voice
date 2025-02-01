@@ -206,6 +206,7 @@ trove-classifiers==2024.3.25
 twine==5.0.0
 typer==0.11.1
 typing_extensions==4.12.2
+urllib3
 userpath==1.9.2
 uvicorn==0.29.0
 uvloop==0.19.0
