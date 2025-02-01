@@ -79,23 +79,30 @@ async def media_stream(websocket: WebSocket):
     print("Client connected")
     
     try:
-        # Use websocket-client instead of websockets
-        ws_url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01'
+        # Correct WebSocket URL
+        ws_url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'
         headers = [
             "Authorization: Bearer " + OPENAI_API_KEY,
             "OpenAI-Beta: realtime=v1"
         ]
 
-        def on_open():
-            print("Connected to OpenAI WebSocket.")
+        def on_open(ws):
+            print("Connected to OpenAI WebSocket")
+            # Send initial configuration
+            event = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "speech"],
+                    "instructions": SYSTEM_MESSAGE
+                }
+            }
+            ws.send(json.dumps(event))
 
-        def on_message(message):
+        def on_message(ws, message):
             try:
                 response = json.loads(message)
-                if response.get("type") in LOG_EVENT_TYPES:
-                    print(f"Received event: {response['type']}", response)
-                if response.get("type") == "session.updated":
-                    print("Session updated successfully:", response)
+                print(f"Received OpenAI event:", json.dumps(response, indent=2))
+                
                 if response.get("type") == "response.audio.delta" and response.get("delta"):
                     audio_delta = {
                         "event": "media",
@@ -120,17 +127,29 @@ async def media_stream(websocket: WebSocket):
 
         async def receive_telnyx_messages():
             while True:
-                data = await websocket.receive_text()
-                message = json.loads(data)
-                event_type = message.get("event")
-                if event_type == "media":
-                    if openai_ws.sock and openai_ws.sock.connected:
-                        openai_ws.send(json.dumps(message))
-                elif event_type == "start":
-                    stream_sid = message["stream_id"]
-                    print(f"Incoming stream has started: {stream_sid}")
-                else:
-                    print(f"Received non-media event: {event_type}")
+                try:
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
+                    event_type = message.get("event")
+                    print(f"Received Telnyx event: {event_type}")
+                    
+                    if event_type == "media":
+                        if openai_ws.sock and openai_ws.sock.connected:
+                            # Format the audio data for OpenAI
+                            audio_event = {
+                                "type": "audio.data",
+                                "audio": {
+                                    "data": message["media"]["payload"]
+                                }
+                            }
+                            openai_ws.send(json.dumps(audio_event))
+                    elif event_type == "start":
+                        stream_sid = message["stream_id"]
+                        print(f"Incoming stream has started: {stream_sid}")
+                    else:
+                        print(f"Received non-media event: {event_type}")
+                except Exception as e:
+                    print(f"Error processing Telnyx message: {e}")
 
         # Run Telnyx message receiver
         await receive_telnyx_messages()
