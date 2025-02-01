@@ -150,12 +150,18 @@ async def media_stream(websocket: WebSocket):
                         if openai_ws.sock and openai_ws.sock.connected:
                             # Format the audio data for OpenAI
                             audio_event = {
-                                "type": "audio.data",
+                                "type": "input_audio_buffer.append",
                                 "audio": {
                                     "data": message["media"]["payload"]
                                 }
                             }
                             openai_ws.send(json.dumps(audio_event))
+                            
+                            # Send commit event after appending audio data
+                            commit_event = {
+                                "type": "input_audio_buffer.commit"
+                            }
+                            openai_ws.send(json.dumps(commit_event))
                     elif event_type == "start":
                         stream_sid = message["stream_id"]
                         print(f"Incoming stream has started: {stream_sid}")
