@@ -1,5 +1,5 @@
 fastapi
 python-dotenv
 uvicorn
-websockets
+websocket-client
 openai
