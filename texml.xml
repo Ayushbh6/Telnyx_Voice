@@ -1,7 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Answer/>
-    <Gather input="speech" timeout="5" speechTimeout="2" action="/transcribe" method="POST">
-        <Say voice="female">Hello! I'm your AI assistant. How can I help you today?</Say>
-    </Gather>
+    <Say voice="female">Hello! I'm your AI assistant. How can I help you today?</Say>
+    <Start>
+        <Transcription 
+            language="en" 
+            interimResults="true" 
+            transcriptionEngine="A"
+            transcriptionCallback="/transcribe" 
+            transcriptionCallbackMethod="POST"
+            transcriptionTracks="inbound"
+        />
+    </Start>
+    <Pause length="300"/>
 </Response>

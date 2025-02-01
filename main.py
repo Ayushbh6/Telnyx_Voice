@@ -48,41 +48,55 @@ async def get_ai_response(user_input: str) -> str:
         logger.error(f"Error getting AI response: {e}")
         return "I apologize, but I'm having trouble processing your request right now."
 
-@app.post("/transcribe")
-async def handle_transcription(request: Request):
-    """Handle the transcribed speech and return TeXML with AI response."""
-    try:
-        # Get the transcribed text from Telnyx's Gather
-        form_data = await request.form()
-        transcription = form_data.get('speech_result', '')
-        logger.info(f"Received transcription: {transcription}")
-
-        if not transcription:
-            response_text = "I didn't catch that. Could you please try again?"
-        else:
-            # Get AI response
-            response_text = await get_ai_response(transcription)
-            logger.info(f"AI Response: {response_text}")
-
-        # Create TeXML response with Say and Gather
-        texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+# TeXML Templates
+RESPONSE_TEXML = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="female">{response_text}</Say>
-    <Gather input="speech" timeout="5" speechTimeout="2" action="/transcribe" method="POST">
-        <Say voice="female">What else would you like to know?</Say>
-    </Gather>
+    <Start>
+        <Transcription 
+            language="en" 
+            interimResults="true" 
+            transcriptionEngine="A"
+            transcriptionCallback="/transcribe" 
+            transcriptionCallbackMethod="POST"
+            transcriptionTracks="inbound"
+        />
+    </Start>
+    <Pause length="300"/>
 </Response>"""
-        
-        return PlainTextResponse(content=texml, media_type="text/xml")
 
-    except Exception as e:
-        logger.error(f"Error in transcribe handler: {e}")
-        error_texml = """<?xml version="1.0" encoding="UTF-8"?>
+ERROR_TEXML = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="female">I'm sorry, but I encountered an error. Please try again later.</Say>
     <Hangup/>
 </Response>"""
-        return PlainTextResponse(content=error_texml, media_type="text/xml")
+
+@app.post("/transcribe")
+async def handle_transcription(request: Request):
+    """Handle the transcribed speech and return TeXML with AI response."""
+    try:
+        data = await request.json()
+        logger.info(f"Received transcription data: {data}")
+        
+        if data.get("status") == "final":
+            transcription = data.get("transcript", "")
+            
+            if not transcription:
+                response_text = "I didn't catch that. Could you please try again?"
+            else:
+                response_text = await get_ai_response(transcription)
+                logger.info(f"AI Response: {response_text}")
+
+            return PlainTextResponse(
+                content=RESPONSE_TEXML.format(response_text=response_text),
+                media_type="text/xml"
+            )
+        
+        return PlainTextResponse(content="", status_code=200)
+
+    except Exception as e:
+        logger.error(f"Error in transcription handler: {e}")
+        return PlainTextResponse(content=ERROR_TEXML, media_type="text/xml")
 
 if __name__ == "__main__":
     import uvicorn
