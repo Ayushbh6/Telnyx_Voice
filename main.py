@@ -157,10 +157,10 @@ async def media_stream(websocket: WebSocket):
                     "session": {
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.3,  # Lower threshold for quicker speech detection
-                            "prefix_padding_ms": 150,  # Reduced from 300
-                            "silence_duration_ms": 400,  # Reduced from 600
-                            "create_response": True,
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,
+                            "create_response": True  # Add this to auto-create responses
                         },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
