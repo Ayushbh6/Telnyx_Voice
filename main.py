@@ -103,7 +103,20 @@ async def media_stream(websocket: WebSocket):
                 response = json.loads(message)
                 print(f"Received OpenAI event:", json.dumps(response, indent=2))
                 
-                if response.get("type") == "response.audio.delta" and response.get("delta"):
+                # Handle audio responses
+                if response.get("type") == "response.content_part.added":
+                    if response.get("part", {}).get("type") == "audio":
+                        print("Audio content received, forwarding to Telnyx")
+                        audio_delta = {
+                            "event": "media",
+                            "media": {
+                                "payload": response.get("part", {}).get("data", "")
+                            }
+                        }
+                        asyncio.run(websocket.send_json(audio_delta))
+                
+                # Keep existing audio.delta handling for backward compatibility
+                elif response.get("type") == "response.audio.delta" and response.get("delta"):
                     audio_delta = {
                         "event": "media",
                         "media": {
