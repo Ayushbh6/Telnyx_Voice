@@ -85,12 +85,18 @@ async def media_stream(websocket: WebSocket):
                     "OpenAI-Beta": "realtime=v1"
                 }
         ) as openai_ws:
-
+            # Add initial response.create event after session update
             async def send_session_update():
                 session_update = {
                     "type": "session.update",
                     "session": {
-                        "turn_detection": {"type": "server_vad"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,
+                            "create_response": True  # Add this to auto-create responses
+                        },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
                         "voice": VOICE,
@@ -101,6 +107,8 @@ async def media_stream(websocket: WebSocket):
                 }
                 print("Sending session update:", json.dumps(session_update))
                 await openai_ws.send(json.dumps(session_update))
+                # Send initial response.create to start the conversation
+                await openai_ws.send(json.dumps({"type": "response.create"}))
 
             # Wait to send session update after WebSocket connection is stable
             await asyncio.sleep(0.25)
@@ -132,10 +140,17 @@ async def media_stream(websocket: WebSocket):
                     event_type = message.get("event")
                     if event_type == "media":
                         if openai_ws.open:
-                            await openai_ws.send(json.dumps(message))
+                            # Wrap the audio data in the correct event type
+                            audio_event = {
+                                "type": "input_audio_buffer.append",
+                                "audio": message["media"]["payload"]
+                            }
+                            await openai_ws.send(json.dumps(audio_event))
                     elif event_type == "start":
                         stream_sid = message["stream_id"]
                         print(f"Incoming stream has started: {stream_sid}")
+                    elif event_type == "stop":
+                        print("Stream stopped")
                     else:
                         print(f"Received non-media event: {event_type}")
 
