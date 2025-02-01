@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import time
+import base64
 
 import websockets
 from dotenv import load_dotenv
@@ -78,6 +79,9 @@ async def media_stream(fastapi_ws: WebSocket):
     await fastapi_ws.accept()
     print("Client connected")
 
+    # Create an asyncio.Queue to hold media data
+    media_queue = asyncio.Queue()
+
     async def handle_openai_message(openai_ws, message, client_ws):
         try:
             response = json.loads(message)
@@ -91,7 +95,7 @@ async def media_stream(fastapi_ws: WebSocket):
                 audio_delta = {
                     "event": "media",
                     "media": {
-                        "payload": response["delta"],
+                        "payload": base64.b64encode(response["delta"].encode()).decode(),
                         "timestamp": int(time.time() * 1000),
                         "encoding": "L16", # Keep as L16 as per current logic, can convert to g711 if needed.
                         "channels": 1,
@@ -103,33 +107,59 @@ async def media_stream(fastapi_ws: WebSocket):
         except Exception as e:
             print("Error processing OpenAI message:", e, "Raw message:", message)
 
-    async def handle_openai_connection(client_ws):
+    async def handle_openai_connection(client_ws, media_q):
         uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1"
         }
-        async with websockets.connect(uri, extra_headers=headers) as openai_ws:
-            print("OpenAI WebSocket connected")
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "turn_detection": {"type": "server_vad"},
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "voice": VOICE,
-                    "instructions": SYSTEM_MESSAGE,
-                    "modalities": ["text", "audio"],
-                    "temperature": 0.8,
+        try:
+            async with websockets.connect(uri, extra_headers=headers) as openai_ws:
+                print("OpenAI WebSocket connected")
+                session_update = {
+                    "type": "session.update",
+                    "session": {
+                        "turn_detection": {"type": "server_vad"},
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
+                        "voice": VOICE,
+                        "instructions": SYSTEM_MESSAGE,
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8,
+                    }
                 }
-            }
-            print("Sending session update:", json.dumps(session_update))
-            await openai_ws.send(json.dumps(session_update))
+                print("Sending session update:", json.dumps(session_update))
+                await openai_ws.send(json.dumps(session_update))
 
-            async for message in openai_ws:
-                await handle_openai_message(openai_ws, message, client_ws)
+                async def receive_from_openai():
+                    async for message in openai_ws:
+                        await handle_openai_message(openai_ws, message, client_ws)
 
-    openai_task = asyncio.create_task(handle_openai_connection(fastapi_ws))
+                async def send_to_openai():
+                    while True:
+                        media = await media_q.get()
+                        if media is None:
+                            print("No more media to send. Closing send_to_openai task.")
+                            break
+                        print(f"Sending media to OpenAI: {len(media)} bytes")
+                        await openai_ws.send(media)
+
+                receiver_task = asyncio.create_task(receive_from_openai())
+                sender_task = asyncio.create_task(send_to_openai())
+
+                done, pending = await asyncio.wait(
+                    [receiver_task, sender_task],
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+
+        except Exception as e:
+            print(f"Error in OpenAI WebSocket connection: {e}")
+
+    openai_task = asyncio.create_task(handle_openai_connection(fastapi_ws, media_queue))
 
     try:
         while True:
@@ -137,10 +167,18 @@ async def media_stream(fastapi_ws: WebSocket):
             message = json.loads(data)
             event_type = message.get("event")
             if event_type == "media":
-                # Send media to OpenAI
-                # Assuming you have a reference to openai_ws here
-                # You might need to adjust the handle_openai_connection to store openai_ws
-                pass  # Handle sending media
+                # Extract the media payload and enqueue it
+                media_payload = message.get("media", {}).get("payload")
+                if media_payload:
+                    try:
+                        # Decode the media payload from base64
+                        media_bytes = base64.b64decode(media_payload)
+                        await media_queue.put(media_bytes)
+                        print(f"Enqueued media payload: {len(media_bytes)} bytes")
+                    except Exception as e:
+                        print("Failed to decode media payload:", e)
+                else:
+                    print("No media payload found in message.")
             elif event_type == "start":
                 stream_sid = message["stream_id"]
                 print(f"Incoming stream has started: {stream_sid}")
@@ -151,6 +189,7 @@ async def media_stream(fastapi_ws: WebSocket):
     except Exception as e:
         print(f"Error in media_stream: {e}")
     finally:
+        await media_queue.put(None)  # Signal the send_to_openai task to exit
         openai_task.cancel()
         print("OpenAI task cancelled.")
 
