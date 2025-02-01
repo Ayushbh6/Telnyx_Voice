@@ -1,9 +1,8 @@
 import os
 import asyncio
 import json
-import threading
 
-from websocket import WebSocketApp
+import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,102 +78,69 @@ async def media_stream(websocket: WebSocket):
     print("Client connected")
     
     try:
-        # Correct WebSocket URL
-        ws_url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'
-        headers = [
-            "Authorization: Bearer " + OPENAI_API_KEY,
-            "OpenAI-Beta: realtime=v1"
-        ]
-
-        def on_open(ws):
-            print("Connected to OpenAI WebSocket")
-            # Send initial configuration with correct modalities
-            event = {
-                "type": "response.create",
-                "response": {
-                    "modalities": ["text", "audio"],
-                    "instructions": SYSTEM_MESSAGE
+        # Updated OpenAI WebSocket URL and headers
+        async with websockets.connect(
+                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+                extra_headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
                 }
-            }
-            ws.send(json.dumps(event))
+        ) as openai_ws:
 
-        def on_message(ws, message):
-            try:
-                response = json.loads(message)
-                print(f"Received OpenAI event:", json.dumps(response, indent=2))
-                
-                # Handle text transcript and audio responses
-                if response.get("type") == "response.output.done":
-                    for item in response.get("output", []):
-                        if item.get("content"):
-                            for content in item["content"]:
-                                if content.get("type") == "audio" and content.get("data"):
-                                    audio_delta = {
-                                        "event": "media",
-                                        "media": {
-                                            "payload": content["data"]
-                                        }
-                                    }
-                                    asyncio.run(websocket.send_json(audio_delta))
-
-                # Keep existing audio.delta handling for backward compatibility
-                elif response.get("type") == "response.audio.delta" and response.get("delta"):
-                    audio_delta = {
-                        "event": "media",
-                        "media": {
-                            "payload": response["delta"]
-                        }
+            async def send_session_update():
+                session_update = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "instructions": SYSTEM_MESSAGE,
+                        "voice": VOICE,
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "temperature": 0.8,
                     }
-                    asyncio.run(websocket.send_json(audio_delta))
-            except Exception as e:
-                print("Error processing OpenAI message:", e, "Raw message:", message)
+                }
+                print("Sending session update:", json.dumps(session_update))
+                await openai_ws.send(json.dumps(session_update))
 
-        openai_ws = WebSocketApp(
-            ws_url,
-            header=headers,
-            on_open=on_open,
-            on_message=on_message
-        )
+            # Wait to send session update after WebSocket connection is stable
+            await asyncio.sleep(0.25)
+            await send_session_update()
 
-        # Run the WebSocket in a separate thread
-        ws_thread = threading.Thread(target=openai_ws.run_forever)
-        ws_thread.start()
+            async def receive_openai_messages():
+                async for message in openai_ws:
+                    try:
+                        response = json.loads(message)
+                        if response.get("type") in LOG_EVENT_TYPES:
+                            print(f"Received event: {response['type']}", response)
+                        if response.get("type") == "session.updated":
+                            print("Session updated successfully:", response)
+                        if response.get("type") == "response.audio.delta" and response.get("delta"):
+                            audio_delta = {
+                                "event": "media",
+                                "media": {
+                                    "payload": response["delta"]
+                                }
+                            }
+                            await websocket.send_json(audio_delta)
+                    except Exception as e:
+                        print("Error processing OpenAI message:", e, "Raw message:", message)
 
-        async def receive_telnyx_messages():
-            while True:
-                try:
+            async def receive_telnyx_messages():
+                while True:
                     data = await websocket.receive_text()
                     message = json.loads(data)
                     event_type = message.get("event")
-                    print(f"Received Telnyx event: {event_type}")
-                    
                     if event_type == "media":
-                        if openai_ws.sock and openai_ws.sock.connected:
-                            # Send raw audio data directly
-                            audio_event = {
-                                "type": "input_audio_buffer.append",
-                                "audio": message["media"]["payload"]  # Send raw audio bytes
-                            }
-                            openai_ws.send(json.dumps(audio_event))
-                            
-                            # Accumulate more audio before committing
-                            # You might want to implement a buffer system here
-                            await asyncio.sleep(0.1)  # Wait for more audio
-                            
-                            commit_event = {
-                                "type": "input_audio_buffer.commit"
-                            }
-                            openai_ws.send(json.dumps(commit_event))
+                        if openai_ws.open:
+                            await openai_ws.send(json.dumps(message))
                     elif event_type == "start":
                         stream_sid = message["stream_id"]
                         print(f"Incoming stream has started: {stream_sid}")
                     else:
                         print(f"Received non-media event: {event_type}")
-                except Exception as e:
-                    print(f"Error processing Telnyx message: {e}")
 
-        # Run Telnyx message receiver
-        await receive_telnyx_messages()
+            # Run OpenAI and Telnyx message receivers concurrently
+            await asyncio.gather(receive_openai_messages(), receive_telnyx_messages())
 
     except WebSocketDisconnect:
         print("Client disconnected.")
