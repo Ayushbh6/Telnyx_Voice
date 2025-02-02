@@ -3,11 +3,11 @@ import asyncio
 import json
 import audioop
 import logging
+import wave  # Added missing import
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
 import websockets
-import wave
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Configuration
-SYSTEM_MESSAGE = """..."""  # Your existing system message here
+# Configuration - PUT YOUR ACTUAL SYSTEM MESSAGE HERE
+SYSTEM_MESSAGE = """You are a helpful assistant."""
 SAMPLE_RATE = 8000
 FRAME_DURATION = 30  # ms
 VAD_AGGRESSIVENESS = 3
@@ -49,7 +49,7 @@ app.add_middleware(
 class VoiceActivityDetector:
     def __init__(self):
         self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        self.frame_size = int(SAMPLE_RATE * FRAME_DURATION / 1000) * 2  # 16-bit
+        self.frame_size = int(SAMPLE_RATE * FRAME_DURATION / 1000) * 2
         self.silence_frames_needed = int(SILENCE_THRESHOLD / FRAME_DURATION)
         self.reset()
         
@@ -59,6 +59,9 @@ class VoiceActivityDetector:
         self.speech_detected = False
 
     def process_frame(self, frame: bytes) -> bool:
+        if len(frame) < self.frame_size:
+            return False
+            
         if self.vad.is_speech(frame, SAMPLE_RATE):
             self.audio_buffer.extend(frame)
             self.silence_frames_count = 0
@@ -111,21 +114,23 @@ async def process_conversation_turn(audio_buffer: bytes, websocket: WebSocket):
         response_text = chat_response.choices[0].message.content
         logger.info(f"Generated response: {response_text}")
 
-        # Generate TTS audio
-        tts_audio = elevenlabs_client.generate(
+        # Generate TTS audio (streaming)
+        tts_response = elevenlabs_client.generate(
             text=response_text,
             voice=VOICE_ID,
-            model="eleven_turbo_v2_5"
+            model="eleven_turbo_v2_5",
+            stream=True
         )
 
-        # Convert and stream audio back
-        pcm_audio = ulaw_to_pcm(tts_audio)
-        ulaw_audio = pcm_to_ulaw(pcm_audio)
-        
-        await websocket.send_json({
-            "event": "media",
-            "media": {"payload": ulaw_audio}
-        })
+        # Stream audio back in chunks
+        async for chunk in tts_response:
+            if chunk:
+                pcm_audio = ulaw_to_pcm(chunk)
+                ulaw_chunk = pcm_to_ulaw(pcm_audio)
+                await websocket.send_json({
+                    "event": "media",
+                    "media": {"payload": ulaw_chunk}
+                })
 
     except Exception as e:
         logger.error(f"Processing error: {str(e)}")
@@ -138,12 +143,12 @@ async def root():
 
 @app.post("/inbound")
 async def incoming_call(request: Request):
+    host = request.headers.get('host', 'telnyxvoice-production.up.railway.app')
     texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
-            <Stream url="wss://{request.headers['host']}/media-stream"/>
+            <Stream url="wss://{host}/media-stream"/>
         </Start>
-        <Speak>Welcome to AI by DNA. Please wait while we connect you.</Speak>
     </Response>"""
     return PlainTextResponse(texml_response, media_type="text/xml")
 
@@ -154,7 +159,6 @@ async def media_stream(websocket: WebSocket):
     
     vad = VoiceActivityDetector()
     processing_lock = asyncio.Lock()
-    executor = ThreadPoolExecutor()
 
     try:
         while True:
@@ -162,21 +166,19 @@ async def media_stream(websocket: WebSocket):
             message = json.loads(data)
             
             if message.get("event") == "media":
-                # Convert Telnyx μ-law to PCM
                 pcm_data = ulaw_to_pcm(message["media"]["payload"])
                 
                 # Process audio frames
-                with ThreadPoolExecutor() as executor:
-                    while len(pcm_data) >= vad.frame_size:
-                        frame = pcm_data[:vad.frame_size]
-                        pcm_data = pcm_data[vad.frame_size:]
-                        
-                        if vad.process_frame(frame):
-                            if vad.audio_buffer and not processing_lock.locked():
-                                async with processing_lock:
-                                    audio_buffer = bytes(vad.audio_buffer)
-                                    vad.reset()
-                                    await process_conversation_turn(audio_buffer, websocket)
+                while len(pcm_data) >= vad.frame_size:
+                    frame = pcm_data[:vad.frame_size]
+                    pcm_data = pcm_data[vad.frame_size:]
+                    
+                    if vad.process_frame(frame):
+                        if vad.audio_buffer and not processing_lock.locked():
+                            async with processing_lock:
+                                audio_buffer = bytes(vad.audio_buffer)
+                                vad.reset()
+                                await process_conversation_turn(audio_buffer, websocket)
             
             elif message.get("event") == "stop":
                 logger.info("Call ended")
@@ -187,7 +189,6 @@ async def media_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
     finally:
-        executor.shutdown()
         logger.info("Media stream handler closed")
 
 if __name__ == "__main__":
