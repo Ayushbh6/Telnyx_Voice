@@ -1,13 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Answer>
-        <Ringback>tone:ring</Ringback>
-    </Answer>
-    <Connect>
-        <Stream 
-            url="wss://telnyxvoice-production.up.railway.app/media-stream"
-            format="wav"
-            track="both"
-        />
-    </Connect>
+  <Say voice="alice">Welcome to the AI voice assistant. Please wait while we connect you.</Say>
+  <Redirect>https://telnyxvoice-production.up.railway.app/webhook</Redirect>
 </Response>

@@ -1,227 +1,86 @@
 import os
-import asyncio
+import uuid
 import json
-import logging
-import wave
-from io import BytesIO
-from contextlib import asynccontextmanager
-import websockets
-from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
-from openai import OpenAI
-import webrtcvad
-from elevenlabs.client import ElevenLabs
-import audioop  # Added to support audio format conversions
+from flask import Flask, request, Response as FlaskResponse, send_from_directory
+import openai
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure your OpenAI API key (set via environment variable for security)
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-load_dotenv()
+app = Flask(__name__)
 
-# Configuration
-SYSTEM_MESSAGE = """You are the personal call centre agent for AI by DNA..."""
-SAMPLE_RATE = 8000
-FRAME_DURATION = 30
-VAD_AGGRESSIVENESS = 3
-SILENCE_THRESHOLD = 600
-VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
-PORT = int(os.getenv('PORT', 8080))
+# A simple in-memory store for conversation context keyed by CallSid
+conversations = {}
 
-# Initialize clients
-openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-elevenlabs_client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
+# Function to call OpenAI Chat API (multi-turn conversation)
+def chat_with_openai(conversation_history):
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini", 
+        messages=conversation_history,
+        temperature=0.7,
+        max_tokens=150
+    )
+    return response.choices[0].message['content'].strip()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup code
-    logger.info("Starting up...")
-    try:
-        # Warm up APIs
-        openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1
-        )
-        elevenlabs_client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
-        elevenlabs_client.generate(text="ping", voice=VOICE_ID, stream=True)
-    except Exception as e:
-        logger.error(f"Startup warmup failed: {e}")
+# Function to convert text to speech via OpenAI TTS API.
+# (This example assumes the API returns raw binary audio data.)
+def text_to_speech(text):
+    # Call the OpenAI audio TTS endpoint (example using model "tts-1" and voice "alloy")
+    response = openai.Audio.speech.create(
+        model="tts-1",
+        input=text,
+        voice="alloy"
+    )
+    # Generate a unique filename and save the binary audio content.
+    filename = f"response_{uuid.uuid4().hex}.mp3"
+    filepath = os.path.join("static", filename)
+    os.makedirs("static", exist_ok=True)
+    # The actual method to retrieve the audio may differ; here we assume response is raw binary.
+    with open(filepath, "wb") as f:
+        f.write(response)  
+    # Construct a public URL for the saved file.
+    public_url = request.host_url.rstrip("/") + "/static/" + filename
+    return public_url
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # Parse the incoming Telnyx webhook.
+    # Telnyx sends various parameters; we assume the transcription text is passed in "TranscriptionText"
+    data = request.form if request.form else request.json or {}
+    call_sid = data.get("CallSid", "unknown")
+    transcription = data.get("TranscriptionText", "").strip()
     
-    yield
+    # Initialize conversation history if needed.
+    if call_sid not in conversations:
+        # Start with a system prompt defining the assistant’s role.
+        conversations[call_sid] = [{"role": "system", "content": "You are an AI voice assistant."}]
     
-    # Shutdown code
-    logger.info("Shutting down...")
-
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class VoiceActivityDetector:
-    def __init__(self):
-        self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        self.frame_size = int(SAMPLE_RATE * FRAME_DURATION / 1000) * 2
-        self.silence_frames_needed = int(SILENCE_THRESHOLD / FRAME_DURATION)
-        self.reset()
-        
-    def reset(self):
-        self.audio_buffer = bytearray()
-        self.silence_frames_count = 0
-        self.speech_detected = False
-
-    def process_frame(self, frame: bytes):
-        if len(frame) < self.frame_size:
-            return False
-            
-        if self.vad.is_speech(frame, SAMPLE_RATE):
-            self.audio_buffer.extend(frame)
-            self.silence_frames_count = 0
-            self.speech_detected = True
-            return False
-            
-        if self.speech_detected:
-            self.silence_frames_count += 1
-            return self.silence_frames_count >= self.silence_frames_needed
-        return False
-
-def convert_audio(input_data: bytes, in_format: str, out_format: str) -> bytes:
-    """Convert between audio formats using raw PCM as intermediate"""
-    if in_format == out_format:
-        return input_data
-        
-    # Convert to PCM first
-    if in_format == 'ulaw':
-        pcm = audioop.ulaw2lin(input_data, 2)
-    else:
-        pcm = input_data
-
-    # Convert to target format
-    if out_format == 'ulaw':
-        return audioop.lin2ulaw(pcm, 2)
-    return pcm
-
-async def process_conversation_turn(audio_buffer: bytes, websocket: WebSocket):
-    try:
-        # Convert Telnyx μ-law to PCM
-        pcm_audio = convert_audio(audio_buffer, 'ulaw', 'pcm')
-        
-        # Create WAV file
-        with BytesIO() as wav_buffer:
-            with wave.open(wav_buffer, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(pcm_audio)
-            wav_buffer.seek(0)
-            
-            # Transcribe with Whisper
-            transcript = openai_client.audio.transcriptions.create(
-                file=("audio.wav", wav_buffer.read(), "audio/wav"),
-                model="whisper-1"
-            )
-            logger.info(f"Transcription: {transcript.text}")
-
-        # Generate response
-        chat_response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": SYSTEM_MESSAGE},
-                {"role": "user", "content": transcript.text}
-            ],
-            temperature=0.7,
-            max_tokens=150
-        )
-        response_text = chat_response.choices[0].message.content
-        
-        # Generate TTS
-        tts_response = elevenlabs_client.generate(
-            text=response_text,
-            voice=VOICE_ID,
-            model="eleven_turbo_v2",
-            stream=True
-        )
-
-        # Stream audio back
-        async for chunk in tts_response:
-            if chunk:
-                ulaw_audio = convert_audio(chunk, 'pcm', 'ulaw')
-                await websocket.send_json({
-                    "event": "media",
-                    "media": {
-                        "payload": ulaw_audio.hex(),
-                        "type": "audio/wav"  # Telnyx requires this
-                    }
-                })
-
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        raise
-
-@app.get("/")
-async def root():
-    return {"message": "AI by DNA Call Center"}
-
-@app.post("/inbound")
-async def incoming_call(request: Request):
-    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Answer>
-            <Ringback>tone:ring</Ringback>
-        </Answer>
-        <Connect>
-            <Stream url="wss://telnyxvoice-production.up.railway.app/media-stream"
-                   format="wav"
-                   track="both"/>
-        </Connect>
-    </Response>"""
-    return PlainTextResponse(texml, media_type="text/xml")
-
-@app.websocket("/media-stream")
-async def media_stream(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket connected")
+    # If caller’s speech was transcribed, add it as a user message.
+    if transcription:
+        conversations[call_sid].append({"role": "user", "content": transcription})
     
-    vad = VoiceActivityDetector()
-    active = True
+    # Call OpenAI’s Chat API to get the assistant’s response.
+    ai_response = chat_with_openai(conversations[call_sid])
+    conversations[call_sid].append({"role": "assistant", "content": ai_response})
+    
+    # Use OpenAI’s TTS API to convert the assistant response into speech.
+    audio_url = text_to_speech(ai_response)
+    
+    # Return a TeXML document that plays the generated audio and then records the next utterance.
+    texml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>{audio_url}</Play>
+  <Record action="https://telnyxvoice-production.up.railway.app/webhook" playBeep="true" finishOnKey="#" />
+</Response>'''
+    
+    # Return the TeXML response with the proper content type.
+    return FlaskResponse(texml_response, mimetype="application/xml")
 
-    try:
-        while active:
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-            
-            if msg.get("event") == "media":
-                raw_audio = bytes.fromhex(msg["media"]["payload"])
-                
-                # Process audio frames
-                remaining = raw_audio
-                while len(remaining) >= vad.frame_size:
-                    frame = remaining[:vad.frame_size]
-                    remaining = remaining[vad.frame_size:]
-                    
-                    if vad.process_frame(frame):
-                        if vad.audio_buffer:
-                            await process_conversation_turn(bytes(vad.audio_buffer), websocket)
-                            vad.reset()
-                            
-            elif msg.get("event") == "stop":
-                active = False
-
-    except websockets.exceptions.ConnectionClosed:
-        logger.info("Connection closed normally")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        logger.info("Closing connection")
-        await websocket.close()
+# Endpoint to serve static audio files.
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    return send_from_directory("static", filename)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # Run the Flask server (use a production server in a real deployment)
+    app.run(host="0.0.0.0", port=5000)
