@@ -1,7 +1,6 @@
 import os
 import asyncio
 import json
-import traceback
 
 import websockets
 from dotenv import load_dotenv
@@ -28,8 +27,8 @@ We are your trusted partner to guide your AI transformation. We are neutral and 
 compose the best solution to your needs. If it does not exist, we will build it for you.
 Conversational Agent
 Pharmaceutical Care
-"AI by DNA has revolutionized our pictograms' way of communicating information to
-patients, by transforming it to a natural language conversation experience for them!!!""
+“AI by DNA has revolutionized our pictograms' way of communicating information to
+patients, by transforming it to a natural language conversation experience for them!!!”
 Sophia Demagou (Piktocare | GET2WORK)
 Conversational Agents
 Conversations are the new markets. AI-driven Conversational agents provide personalized,
@@ -67,9 +66,9 @@ develop, and deploy tailor-made solutions that meet your specific business objec
 Let us turn your data and context into actionable intelligence."
 George Kotzamanis, Co-Founder | Chief Operating Officer
 Get in touch with "AI by DNA" today.
-"We live at a time of massive tech disruption in almost all areas of work and life. We were
+“We live at a time of massive tech disruption in almost all areas of work and life. We were
 getting prepared for this, we are working on it, but now is the time to focus on what we might
-accomplish for you." - Kostas Varsamos, Co-Founder | CEO
+accomplish for you.” - Kostas Varsamos, Co-Founder | CEO
 Offices: Greece (Athens) | Germany (Frankfurt) - Email: contact@aibydna.com
 """
 
@@ -84,7 +83,7 @@ Be friendly and helpful.
 You are proficient in English and Greek.
 Use English as the default language.
 
-IMPORTANT: Keep your answers to maximum 5 lines of text.
+IMPORTANT: Keep your answers to MAXIMUM 5 lines of text.
 """
 VOICE = 'alloy'
 PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
@@ -151,6 +150,7 @@ async def media_stream(websocket: WebSocket):
                     "OpenAI-Beta": "realtime=v1"
                 }
         ) as openai_ws:
+            # Add initial response.create event after session update
             async def send_session_update():
                 session_update = {
                     "type": "session.update",
@@ -160,36 +160,34 @@ async def media_stream(websocket: WebSocket):
                             "threshold": 0.5,
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 600,
-                            "create_response": True
-                        },
-                        "response_interruption": {
-                            "type": "auto"
+                            "create_response": True  # Add this to auto-create responses
                         },
                         "input_audio_format": "g711_ulaw",
                         "output_audio_format": "g711_ulaw",
                         "voice": VOICE,
                         "instructions": SYSTEM_MESSAGE,
                         "modalities": ["text", "audio"],
-                        "temperature": 0.8
+                        "temperature": 0.8,
                     }
                 }
                 print("Sending session update:", json.dumps(session_update))
                 await openai_ws.send(json.dumps(session_update))
+                # Send initial response.create to start the conversation
                 await openai_ws.send(json.dumps({"type": "response.create"}))
 
+            # Wait to send session update after WebSocket connection is stable
             await asyncio.sleep(0.25)
             await send_session_update()
-            
+
             async def receive_openai_messages():
                 async for message in openai_ws:
                     try:
                         response = json.loads(message)
                         if response.get("type") in LOG_EVENT_TYPES:
-                            print(f"Received OpenAI event: {response['type']}", response)
+                            print(f"Received event: {response['type']}", response)
                         if response.get("type") == "session.updated":
                             print("Session updated successfully:", response)
                         if response.get("type") == "response.audio.delta" and response.get("delta"):
-                            print("Sending audio delta to Telnyx")
                             audio_delta = {
                                 "event": "media",
                                 "media": {
@@ -202,55 +200,32 @@ async def media_stream(websocket: WebSocket):
 
             async def receive_telnyx_messages():
                 while True:
-                    try:
-                        data = await websocket.receive_text()
-                        message = json.loads(data)
-                        event_type = message.get("event")
-                        
-                        print(f"Received Telnyx event: {event_type}")
-                        
-                        if event_type == "media":
-                            if not openai_ws.open:
-                                print("Warning: OpenAI WebSocket is closed")
-                                continue
-                                
-                            print("Received media payload, sending to OpenAI")
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
+                    event_type = message.get("event")
+                    if event_type == "media":
+                        if openai_ws.open:
+                            # Wrap the audio data in the correct event type
                             audio_event = {
                                 "type": "input_audio_buffer.append",
                                 "audio": message["media"]["payload"]
                             }
                             await openai_ws.send(json.dumps(audio_event))
-                            
-                        elif event_type == "start":
-                            stream_sid = message["stream_id"]
-                            print(f"Incoming stream started: {stream_sid}")
-                            
-                        elif event_type == "stop":
-                            print("Stream stopped")
-                            
-                        else:
-                            print(f"Received non-media event from Telnyx: {event_type}")
-                            
-                    except websockets.exceptions.ConnectionClosed:
-                        print("Telnyx WebSocket connection closed")
-                        break
-                    except Exception as e:
-                        print(f"Error in receive_telnyx_messages: {str(e)}")
-                        print(f"Raw data: {data if 'data' in locals() else 'No data'}")
+                    elif event_type == "start":
+                        stream_sid = message["stream_id"]
+                        print(f"Incoming stream has started: {stream_sid}")
+                    elif event_type == "stop":
+                        print("Stream stopped")
+                    else:
+                        print(f"Received non-media event: {event_type}")
 
-            try:
-                await asyncio.gather(
-                    receive_openai_messages(),
-                    receive_telnyx_messages()
-                )
-            except Exception as e:
-                print(f"Error in main loop: {str(e)}")
+            # Run OpenAI and Telnyx message receivers concurrently
+            await asyncio.gather(receive_openai_messages(), receive_telnyx_messages())
 
     except WebSocketDisconnect:
-        print("Client disconnected")
+        print("Client disconnected.")
     except Exception as e:
-        print(f"WebSocket error: {str(e)}")
-        traceback.print_exc()
+        print("WebSocket error:", e)
 
 # Start the FastAPI server
 if __name__ == "__main__":
