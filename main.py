@@ -4,7 +4,7 @@ import json
 import logging
 import wave
 from io import BytesIO
-
+from contextlib import asynccontextmanager
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, Request
@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 import webrtcvad
 from elevenlabs.client import ElevenLabs
+import audioop  # Added to support audio format conversions
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +34,28 @@ PORT = int(os.getenv('PORT', 8080))
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 elevenlabs_client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup code
+    logger.info("Starting up...")
+    try:
+        # Warm up APIs
+        openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1
+        )
+        elevenlabs_client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
+        elevenlabs_client.generate(text="ping", voice=VOICE_ID, stream=True)
+    except Exception as e:
+        logger.error(f"Startup warmup failed: {e}")
+    
+    yield
+    
+    # Shutdown code
+    logger.info("Shutting down...")
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +156,7 @@ async def process_conversation_turn(audio_buffer: bytes, websocket: WebSocket):
                 await websocket.send_json({
                     "event": "media",
                     "media": {
-                        "payload": ulaw_audio,
+                        "payload": ulaw_audio.hex(),
                         "type": "audio/wav"  # Telnyx requires this
                     }
                 })
@@ -142,19 +164,6 @@ async def process_conversation_turn(audio_buffer: bytes, websocket: WebSocket):
     except Exception as e:
         logger.error(f"Processing error: {e}")
         raise
-
-@app.on_event("startup")
-async def startup():
-    # Warm up APIs
-    try:
-        openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1
-        )
-        elevenlabs_client.generate(text="ping", voice=VOICE_ID, stream=True)
-    except Exception as e:
-        logger.error(f"Startup warmup failed: {e}")
 
 @app.get("/")
 async def root():
@@ -211,6 +220,7 @@ async def media_stream(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
     finally:
         logger.info("Closing connection")
+        await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
