@@ -1,108 +1,43 @@
 import os
 import asyncio
 import json
+import audioop
+import logging
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
+import wave
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from openai import OpenAI
+import webrtcvad
+from elevenlabs.client import ElevenLabs
 
-# Load environment variables from .env file
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
 
-# Retrieve the OpenAI API key from environment variables
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+# Configuration
+SYSTEM_MESSAGE = """..."""  # Your existing system message here
+SAMPLE_RATE = 8000
+FRAME_DURATION = 30  # ms
+VAD_AGGRESSIVENESS = 3
+SILENCE_THRESHOLD = 600  # ms of silence to consider speech ended
+VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # ElevenLabs voice ID
+PORT = int(os.getenv('PORT', 8080))
 
-if not OPENAI_API_KEY:
-    print('Missing OpenAI API key. Please set it in the .env file.')
-    exit(1)
-
-AI_by_DNA = """We empower organizations with Agentic AI
-AI by DNA is an Artificial Intelligence transformation
-agency that supports ambitious organizations to scale
-their AI and Data capabilities, augmenting efficiency,
-performance and growth.
-We are your trusted partner to guide your AI transformation. We are neutral and will
-compose the best solution to your needs. If it does not exist, we will build it for you.
-Conversational Agent
-Pharmaceutical Care
-“AI by DNA has revolutionized our pictograms' way of communicating information to
-patients, by transforming it to a natural language conversation experience for them!!!”
-Sophia Demagou (Piktocare | GET2WORK)
-Conversational Agents
-Conversations are the new markets. AI-driven Conversational agents provide personalized,
-real-time and in-depth interaction.
-Unveil new AI by Chat opportunities: AI by Chat With reactively support and anytime recommend your product & services . you can proactively promote,
-Gain and retain
-customers.
-Unlock the power of AI by Phone: Human-like AI Voice Assistants are radically changing
-the way businesses use their phone lines. Improve productivity, efficiency and customer
-satisfaction.
-Scale your potential with AI by Clone: Such a video-based agent, showcasing a human-like
-avatar, converse with people inside a specific knowledge context, via audio and in multiple
-languages. Transform your customers' experience.
-Knowledge Assistants
-In the fast-paced environment of today, quick access to accurate information and reliable
-action taking are key to enhance efficiency.
-Unique Internal Data Retrieval Focus: AI by DNA assistants focus on internal information
-retrieval, tapping seamlessly into complex sources, to generate your own knowledge based
-search engines.
-This means secure. procedures etc.
-streamlined information and work flows, i.e. more accurate, efficient and
-Improve efficiency on regulatory & compliance, inventory management, operating
-Decision Engines
-Data Processing & Predictive Analytics for Insightful Solutions: drives innovation, AI by DNA insights from complex data sets. efficiency.
-In an era where data
-data analysis capabilities empower you to derive actionable
-Enhance decision-making, operational and commercial
-Real-time data driven decision making: AI by DNA insights that help real-time resource allocation tools set delivers evidence-based
-optimization, comprehensive revenue management,
-dynamic pricing.
-"Looking to harness the power of advanced language models with a foundation in data-
-driven insights? Need a custom agent with predictive analytics, retrieval capabilities,
-and seamless integration with vector stores and other tools? We are here to design,
-develop, and deploy tailor-made solutions that meet your specific business objectives.
-Let us turn your data and context into actionable intelligence."
-George Kotzamanis, Co-Founder | Chief Operating Officer
-Get in touch with "AI by DNA" today.
-“We live at a time of massive tech disruption in almost all areas of work and life. We were
-getting prepared for this, we are working on it, but now is the time to focus on what we might
-accomplish for you.” - Kostas Varsamos, Co-Founder | CEO
-Offices: Greece (Athens) | Germany (Frankfurt) - Email: contact@aibydna.com
-"""
-
-# Constants
-SYSTEM_MESSAGE = f"""
-You are the personal call centre agent for AI by DNA. Here is complete information about AI by DNA:
-{AI_by_DNA}
-
-CRITICAL RESPONSE RULES:
-1. MUST keep responses to 2-3 short sentences maximum
-2. NEVER explain or give background information
-3. Answer directly and briefly
-4. If asked about services, mention only ONE relevant service
-5. End response immediately after answering the core question
-
-Use English as default language. You are also proficient in Greek.
-"""
-VOICE = 'alloy'
-PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
-
-# List of Event Types to log to the console. See OpenAI Realtime API Documentation.
-LOG_EVENT_TYPES = [
-    'response.content.done',
-    'rate_limits.updated',
-    'response.done',
-    'input_audio_buffer.committed',
-    'input_audio_buffer.speech_stopped',
-    'input_audio_buffer.speech_started',
-    'session.created'
-]
+# Initialize clients
+openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+elevenlabs_client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
 
 app = FastAPI()
 
-# Add middleware for CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -111,124 +46,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root route
+class VoiceActivityDetector:
+    def __init__(self):
+        self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self.frame_size = int(SAMPLE_RATE * FRAME_DURATION / 1000) * 2  # 16-bit
+        self.silence_frames_needed = int(SILENCE_THRESHOLD / FRAME_DURATION)
+        self.reset()
+        
+    def reset(self):
+        self.audio_buffer = bytearray()
+        self.silence_frames_count = 0
+        self.speech_detected = False
+
+    def process_frame(self, frame: bytes) -> bool:
+        if self.vad.is_speech(frame, SAMPLE_RATE):
+            self.audio_buffer.extend(frame)
+            self.silence_frames_count = 0
+            self.speech_detected = True
+            return False
+            
+        if self.speech_detected:
+            self.silence_frames_count += 1
+            if self.silence_frames_count >= self.silence_frames_needed:
+                return True  # Speech ended
+                
+        return False
+
+def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
+    return audioop.ulaw2lin(ulaw_data, 2)
+
+def pcm_to_ulaw(pcm_data: bytes) -> bytes:
+    return audioop.lin2ulaw(pcm_data, 2)
+
+async def process_conversation_turn(audio_buffer: bytes, websocket: WebSocket):
+    logger.info("Starting conversation turn processing")
+    
+    try:
+        # Convert to WAV format for Whisper
+        with BytesIO() as wav_buffer:
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(audio_buffer)
+            wav_buffer.seek(0)
+
+            # Transcribe with Whisper
+            transcript = openai_client.audio.transcriptions.create(
+                file=("audio.wav", wav_buffer.read(), "audio/wav"),
+                model="whisper-1"
+            )
+            logger.info(f"Transcription: {transcript.text}")
+
+        # Generate response
+        chat_response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": transcript.text}
+            ],
+            temperature=0.7,
+            max_tokens=150
+        )
+        response_text = chat_response.choices[0].message.content
+        logger.info(f"Generated response: {response_text}")
+
+        # Generate TTS audio
+        tts_audio = elevenlabs_client.generate(
+            text=response_text,
+            voice=VOICE_ID,
+            model="eleven_turbo_v2_5"
+        )
+
+        # Convert and stream audio back
+        pcm_audio = ulaw_to_pcm(tts_audio)
+        ulaw_audio = pcm_to_ulaw(pcm_audio)
+        
+        await websocket.send_json({
+            "event": "media",
+            "media": {"payload": ulaw_audio}
+        })
+
+    except Exception as e:
+        logger.error(f"Processing error: {str(e)}")
+    finally:
+        logger.info("Conversation turn completed")
+
 @app.get("/")
 async def root():
-    return {"message": "Telnyx Media Stream Server is running!"}
-
-# Route for telnyx to handle incoming and outgoing calls
+    return {"message": "AI by DNA Call Center"}
 
 @app.post("/inbound")
 async def incoming_call(request: Request):
-    print("Incoming call received")
-    headers = request.headers
-    
-    # Construct the correct relative path to the texml.xml file
-    texml_path = os.path.join(os.path.dirname(__file__), 'texml.xml')
-    
-    try:
-        with open(texml_path, 'r') as file:
-            texml_response = file.read()
-        texml_response = texml_response.replace("{host}", headers.get("host"))
-        print(f"TeXML Response: {texml_response}")  # Log the TeXML response
-    except FileNotFoundError:
-        print(f"File not found at: {texml_path}")
-        return PlainTextResponse("TeXML file not found", status_code=500)
-    
+    texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Start>
+            <Stream url="wss://{request.headers['host']}/media-stream"/>
+        </Start>
+        <Speak>Welcome to AI by DNA. Please wait while we connect you.</Speak>
+    </Response>"""
     return PlainTextResponse(texml_response, media_type="text/xml")
 
-# WebSocket route for media-stream
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
-    print("Client connected")
+    logger.info("WebSocket connection accepted")
     
+    vad = VoiceActivityDetector()
+    processing_lock = asyncio.Lock()
+    executor = ThreadPoolExecutor()
+
     try:
-        async with websockets.connect(
-                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-                extra_headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "OpenAI-Beta": "realtime=v1"
-                }
-        ) as openai_ws:
-            # Add initial response.create event after session update
-            async def send_session_update():
-                session_update = {
-                    "type": "session.update",
-                    "session": {
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": True  # Add this to auto-create responses
-                        },
-                        "input_audio_format": "g711_ulaw",
-                        "output_audio_format": "g711_ulaw",
-                        "voice": VOICE,
-                        "instructions": SYSTEM_MESSAGE,
-                        "modalities": ["text", "audio"],
-                        "temperature": 0.8,
-                    }
-                }
-                print("Sending session update:", json.dumps(session_update))
-                await openai_ws.send(json.dumps(session_update))
-                # Send initial response.create to start the conversation
-                await openai_ws.send(json.dumps({"type": "response.create"}))
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message.get("event") == "media":
+                # Convert Telnyx μ-law to PCM
+                pcm_data = ulaw_to_pcm(message["media"]["payload"])
+                
+                # Process audio frames
+                with ThreadPoolExecutor() as executor:
+                    while len(pcm_data) >= vad.frame_size:
+                        frame = pcm_data[:vad.frame_size]
+                        pcm_data = pcm_data[vad.frame_size:]
+                        
+                        if vad.process_frame(frame):
+                            if vad.audio_buffer and not processing_lock.locked():
+                                async with processing_lock:
+                                    audio_buffer = bytes(vad.audio_buffer)
+                                    vad.reset()
+                                    await process_conversation_turn(audio_buffer, websocket)
+            
+            elif message.get("event") == "stop":
+                logger.info("Call ended")
+                break
 
-            # Wait to send session update after WebSocket connection is stable
-            await asyncio.sleep(0.25)
-            await send_session_update()
-
-            async def receive_openai_messages():
-                async for message in openai_ws:
-                    try:
-                        response = json.loads(message)
-                        if response.get("type") in LOG_EVENT_TYPES:
-                            print(f"Received event: {response['type']}", response)
-                        if response.get("type") == "session.updated":
-                            print("Session updated successfully:", response)
-                        if response.get("type") == "response.audio.delta" and response.get("delta"):
-                            audio_delta = {
-                                "event": "media",
-                                "media": {
-                                    "payload": response["delta"]
-                                }
-                            }
-                            await websocket.send_json(audio_delta)
-                    except Exception as e:
-                        print("Error processing OpenAI message:", e, "Raw message:", message)
-
-            async def receive_telnyx_messages():
-                while True:
-                    data = await websocket.receive_text()
-                    message = json.loads(data)
-                    event_type = message.get("event")
-                    if event_type == "media":
-                        if openai_ws.open:
-                            # Wrap the audio data in the correct event type
-                            audio_event = {
-                                "type": "input_audio_buffer.append",
-                                "audio": message["media"]["payload"]
-                            }
-                            await openai_ws.send(json.dumps(audio_event))
-                    elif event_type == "start":
-                        stream_sid = message["stream_id"]
-                        print(f"Incoming stream has started: {stream_sid}")
-                    elif event_type == "stop":
-                        print("Stream stopped")
-                    else:
-                        print(f"Received non-media event: {event_type}")
-
-            # Run OpenAI and Telnyx message receivers concurrently
-            await asyncio.gather(receive_openai_messages(), receive_telnyx_messages())
-
-    except WebSocketDisconnect:
-        print("Client disconnected.")
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("WebSocket connection closed")
     except Exception as e:
-        print("WebSocket error:", e)
+        logger.error(f"WebSocket error: {str(e)}")
+    finally:
+        executor.shutdown()
+        logger.info("Media stream handler closed")
 
-# Start the FastAPI server
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
