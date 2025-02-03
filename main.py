@@ -1,86 +1,234 @@
 import os
-import uuid
+import asyncio
 import json
-from flask import Flask, request, Response as FlaskResponse, send_from_directory
-import openai
 
-# Configure your OpenAI API key (set via environment variable for security)
-openai.api_key = os.getenv("OPENAI_API_KEY")
+import websockets
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
-app = Flask(__name__)
+# Load environment variables from .env file
+load_dotenv()
 
-# A simple in-memory store for conversation context keyed by CallSid
-conversations = {}
+# Retrieve the OpenAI API key from environment variables
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-# Function to call OpenAI Chat API (multi-turn conversation)
-def chat_with_openai(conversation_history):
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini", 
-        messages=conversation_history,
-        temperature=0.7,
-        max_tokens=150
-    )
-    return response.choices[0].message['content'].strip()
+if not OPENAI_API_KEY:
+    print('Missing OpenAI API key. Please set it in the .env file.')
+    exit(1)
 
-# Function to convert text to speech via OpenAI TTS API.
-# (This example assumes the API returns raw binary audio data.)
-def text_to_speech(text):
-    # Call the OpenAI audio TTS endpoint (example using model "tts-1" and voice "alloy")
-    response = openai.Audio.speech.create(
-        model="tts-1",
-        input=text,
-        voice="alloy"
-    )
-    # Generate a unique filename and save the binary audio content.
-    filename = f"response_{uuid.uuid4().hex}.mp3"
-    filepath = os.path.join("static", filename)
-    os.makedirs("static", exist_ok=True)
-    # The actual method to retrieve the audio may differ; here we assume response is raw binary.
-    with open(filepath, "wb") as f:
-        f.write(response)  
-    # Construct a public URL for the saved file.
-    public_url = request.host_url.rstrip("/") + "/static/" + filename
-    return public_url
+AI_by_DNA = """We empower organizations with Agentic AI
+AI by DNA is an Artificial Intelligence transformation
+agency that supports ambitious organizations to scale
+their AI and Data capabilities, augmenting efficiency,
+performance and growth.
+We are your trusted partner to guide your AI transformation. We are neutral and will
+compose the best solution to your needs. If it does not exist, we will build it for you.
+Conversational Agent
+Pharmaceutical Care
+“AI by DNA has revolutionized our pictograms' way of communicating information to
+patients, by transforming it to a natural language conversation experience for them!!!”
+Sophia Demagou (Piktocare | GET2WORK)
+Conversational Agents
+Conversations are the new markets. AI-driven Conversational agents provide personalized,
+real-time and in-depth interaction.
+Unveil new AI by Chat opportunities: AI by Chat With reactively support and anytime recommend your product & services . you can proactively promote,
+Gain and retain
+customers.
+Unlock the power of AI by Phone: Human-like AI Voice Assistants are radically changing
+the way businesses use their phone lines. Improve productivity, efficiency and customer
+satisfaction.
+Scale your potential with AI by Clone: Such a video-based agent, showcasing a human-like
+avatar, converse with people inside a specific knowledge context, via audio and in multiple
+languages. Transform your customers' experience.
+Knowledge Assistants
+In the fast-paced environment of today, quick access to accurate information and reliable
+action taking are key to enhance efficiency.
+Unique Internal Data Retrieval Focus: AI by DNA assistants focus on internal information
+retrieval, tapping seamlessly into complex sources, to generate your own knowledge based
+search engines.
+This means secure. procedures etc.
+streamlined information and work flows, i.e. more accurate, efficient and
+Improve efficiency on regulatory & compliance, inventory management, operating
+Decision Engines
+Data Processing & Predictive Analytics for Insightful Solutions: drives innovation, AI by DNA insights from complex data sets. efficiency.
+In an era where data
+data analysis capabilities empower you to derive actionable
+Enhance decision-making, operational and commercial
+Real-time data driven decision making: AI by DNA insights that help real-time resource allocation tools set delivers evidence-based
+optimization, comprehensive revenue management,
+dynamic pricing.
+"Looking to harness the power of advanced language models with a foundation in data-
+driven insights? Need a custom agent with predictive analytics, retrieval capabilities,
+and seamless integration with vector stores and other tools? We are here to design,
+develop, and deploy tailor-made solutions that meet your specific business objectives.
+Let us turn your data and context into actionable intelligence."
+George Kotzamanis, Co-Founder | Chief Operating Officer
+Get in touch with "AI by DNA" today.
+“We live at a time of massive tech disruption in almost all areas of work and life. We were
+getting prepared for this, we are working on it, but now is the time to focus on what we might
+accomplish for you.” - Kostas Varsamos, Co-Founder | CEO
+Offices: Greece (Athens) | Germany (Frankfurt) - Email: contact@aibydna.com
+"""
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    # Parse the incoming Telnyx webhook.
-    # Telnyx sends various parameters; we assume the transcription text is passed in "TranscriptionText"
-    data = request.form if request.form else request.json or {}
-    call_sid = data.get("CallSid", "unknown")
-    transcription = data.get("TranscriptionText", "").strip()
+# Constants
+SYSTEM_MESSAGE = f"""
+You are the personal call centre agent for AI by DNA. Here is complete information about AI by DNA:
+{AI_by_DNA}
+
+CRITICAL RESPONSE RULES:
+1. MUST keep responses to 2-3 short sentences maximum
+2. NEVER explain or give background information
+3. Answer directly and briefly
+4. If asked about services, mention only ONE relevant service
+5. End response immediately after answering the core question
+
+Use English as default language. You are also proficient in Greek.
+"""
+VOICE = 'alloy'
+PORT = int(os.getenv('PORT', 8080))  # Allow dynamic port assignment
+
+# List of Event Types to log to the console. See OpenAI Realtime API Documentation.
+LOG_EVENT_TYPES = [
+    'response.content.done',
+    'rate_limits.updated',
+    'response.done',
+    'input_audio_buffer.committed',
+    'input_audio_buffer.speech_stopped',
+    'input_audio_buffer.speech_started',
+    'session.created'
+]
+
+app = FastAPI()
+
+# Add middleware for CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Root route
+@app.get("/")
+async def root():
+    return {"message": "Telnyx Media Stream Server is running!"}
+
+# Route for telnyx to handle incoming and outgoing calls
+
+@app.post("/inbound")
+async def incoming_call(request: Request):
+    print("Incoming call received")
+    headers = request.headers
     
-    # Initialize conversation history if needed.
-    if call_sid not in conversations:
-        # Start with a system prompt defining the assistant’s role.
-        conversations[call_sid] = [{"role": "system", "content": "You are an AI voice assistant."}]
+    # Construct the correct relative path to the texml.xml file
+    texml_path = os.path.join(os.path.dirname(__file__), 'texml.xml')
     
-    # If caller’s speech was transcribed, add it as a user message.
-    if transcription:
-        conversations[call_sid].append({"role": "user", "content": transcription})
+    try:
+        with open(texml_path, 'r') as file:
+            texml_response = file.read()
+        texml_response = texml_response.replace("{host}", headers.get("host"))
+        print(f"TeXML Response: {texml_response}")  # Log the TeXML response
+    except FileNotFoundError:
+        print(f"File not found at: {texml_path}")
+        return PlainTextResponse("TeXML file not found", status_code=500)
     
-    # Call OpenAI’s Chat API to get the assistant’s response.
-    ai_response = chat_with_openai(conversations[call_sid])
-    conversations[call_sid].append({"role": "assistant", "content": ai_response})
-    
-    # Use OpenAI’s TTS API to convert the assistant response into speech.
-    audio_url = text_to_speech(ai_response)
-    
-    # Return a TeXML document that plays the generated audio and then records the next utterance.
-    texml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>{audio_url}</Play>
-  <Record action="https://telnyxvoice-production.up.railway.app/webhook" playBeep="true" finishOnKey="#" />
-</Response>'''
-    
-    # Return the TeXML response with the proper content type.
-    return FlaskResponse(texml_response, mimetype="application/xml")
+    return PlainTextResponse(texml_response, media_type="text/xml")
 
-# Endpoint to serve static audio files.
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    return send_from_directory("static", filename)
+# WebSocket route for media-stream
+@app.websocket("/media-stream")
+async def media_stream(websocket: WebSocket):
+    await websocket.accept()
+    print("Client connected")
+    
+    try:
+        async with websockets.connect(
+                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+                extra_headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
+                }
+        ) as openai_ws:
+            # Add initial response.create event after session update
+            async def send_session_update():
+                session_update = {
+                    "type": "session.update",
+                    "session": {
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,
+                            "create_response": True  # Add this to auto-create responses
+                        },
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "voice": VOICE,
+                        "instructions": SYSTEM_MESSAGE,
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8,
+                    }
+                }
+                print("Sending session update:", json.dumps(session_update))
+                await openai_ws.send(json.dumps(session_update))
+                # Send initial response.create to start the conversation
+                await openai_ws.send(json.dumps({"type": "response.create"}))
 
+            # Wait to send session update after WebSocket connection is stable
+            await asyncio.sleep(0.25)
+            await send_session_update()
+
+            async def receive_openai_messages():
+                async for message in openai_ws:
+                    try:
+                        response = json.loads(message)
+                        if response.get("type") in LOG_EVENT_TYPES:
+                            print(f"Received event: {response['type']}", response)
+                        if response.get("type") == "session.updated":
+                            print("Session updated successfully:", response)
+                        if response.get("type") == "response.audio.delta" and response.get("delta"):
+                            audio_delta = {
+                                "event": "media",
+                                "media": {
+                                    "payload": response["delta"]
+                                }
+                            }
+                            await websocket.send_json(audio_delta)
+                    except Exception as e:
+                        print("Error processing OpenAI message:", e, "Raw message:", message)
+
+            async def receive_telnyx_messages():
+                while True:
+                    data = await websocket.receive_text()
+                    message = json.loads(data)
+                    event_type = message.get("event")
+                    if event_type == "media":
+                        if openai_ws.open:
+                            # Wrap the audio data in the correct event type
+                            audio_event = {
+                                "type": "input_audio_buffer.append",
+                                "audio": message["media"]["payload"]
+                            }
+                            await openai_ws.send(json.dumps(audio_event))
+                    elif event_type == "start":
+                        stream_sid = message["stream_id"]
+                        print(f"Incoming stream has started: {stream_sid}")
+                    elif event_type == "stop":
+                        print("Stream stopped")
+                    else:
+                        print(f"Received non-media event: {event_type}")
+
+            # Run OpenAI and Telnyx message receivers concurrently
+            await asyncio.gather(receive_openai_messages(), receive_telnyx_messages())
+
+    except WebSocketDisconnect:
+        print("Client disconnected.")
+    except Exception as e:
+        print("WebSocket error:", e)
+
+# Start the FastAPI server
 if __name__ == "__main__":
-    # Run the Flask server (use a production server in a real deployment)
-    app.run(host="0.0.0.0", port=5000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

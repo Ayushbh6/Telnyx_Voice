@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Welcome to the AI voice assistant. Please wait while we connect you.</Say>
-  <Redirect>https://telnyxvoice-production.up.railway.app/webhook</Redirect>
+    <Answer/>
+    <Say voice="Polly.Joanna">Please wait while we connect your call to the AI voice assistant.</Say>
+    <Connect>
+        <Stream url="wss://telnyxvoice-production.up.railway.app/media-stream" bidirectionalMode="rtp" />
+    </Connect>
 </Response>
