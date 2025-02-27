@@ -65,8 +65,8 @@ We are your trusted partner to guide your AI transformation. We are neutral and 
 compose the best solution to your needs. If it does not exist, we will build it for you.
 Conversational Agent
 Pharmaceutical Care
-“AI by DNA has revolutionized our pictograms' way of communicating information to
-patients, by transforming it to a natural language conversation experience for them!!!”
+"AI by DNA has revolutionized our pictograms' way of communicating information to
+patients, by transforming it to a natural language conversation experience for them!!!
 Sophia Demagou (Piktocare | GET2WORK)
 Conversational Agents
 Conversations are the new markets. AI-driven Conversational agents provide personalized,
@@ -104,9 +104,9 @@ develop, and deploy tailor-made solutions that meet your specific business objec
 Let us turn your data and context into actionable intelligence."
 George Kotzamanis, Co-Founder | Chief Operating Officer
 Get in touch with "AI by DNA" today.
-“We live at a time of massive tech disruption in almost all areas of work and life. We were
+"We live at a time of massive tech disruption in almost all areas of work and life. We were
 getting prepared for this, we are working on it, but now is the time to focus on what we might
-accomplish for you.” - Kostas Varsamos, Co-Founder | CEO
+accomplish for you." - Kostas Varsamos, Co-Founder | CEO
 Offices: Greece (Athens) | Germany (Frankfurt) - Email: contact@aibydna.com
 """
 
@@ -136,8 +136,8 @@ CHAT_MODEL = os.getenv('CHAT_MODEL', "gpt-4o")
 PORT = int(os.getenv('PORT', 8080))
 
 # VAD settings
-FRAME_DURATION_MS = 30  # 30ms frames for WebRTC VAD
-SILENCE_THRESHOLD_MS = 500  # Consider silence after 800ms
+FRAME_DURATION_MS = 20  # 20ms frames for WebRTC VAD (changed from 30ms)
+SILENCE_THRESHOLD_MS = 500  # Consider silence after 500ms
 SPEECH_THRESHOLD_MS = 100  # Consider speech after 100ms
 SAMPLE_RATE = 8000  # 8kHz for ulaw audio from Telnyx
 
@@ -661,8 +661,8 @@ async def process_speech(call_state, websocket, content):
         # Always reset processing state
         call_state.is_processing = False
 
-def ulaw_to_pcm_improved(ulaw_data):
-    """Convert G.711 ulaw data to PCM using a lookup table approach."""
+def ulaw_to_pcm_simplified(ulaw_data):
+    """Convert G.711 ulaw data to PCM using a simplified lookup table approach."""
     # Standard u-law to linear PCM lookup table
     ulaw_to_linear = [
         -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
@@ -706,47 +706,37 @@ def ulaw_to_pcm_improved(ulaw_data):
         index = ~byte & 0xFF
         pcm_data.append(ulaw_to_linear[index])
     
-    logger.info(f"Converted {len(ulaw_data)} ulaw bytes to {len(pcm_data)} PCM samples")
     return pcm_data
 
-def prepare_audio_for_vad_improved(ulaw_data, sample_rate=8000):
+def prepare_audio_for_vad_simplified(ulaw_data):
     """Simplified conversion from ulaw to PCM for VAD."""
     # Convert ulaw to PCM using the lookup table
-    pcm_data = ulaw_to_pcm_improved(ulaw_data)
+    pcm_data = ulaw_to_pcm_simplified(ulaw_data)
     
     # Convert to bytes
     pcm_bytes = pcm_data.tobytes()
-    logger.info(f"PCM bytes size: {len(pcm_bytes)}")
     
     return pcm_bytes
 
-def chunk_audio_for_vad_improved(audio_data, frame_duration_ms=30, sample_rate=8000):
-    """Improved chunking for WebRTC VAD."""
-    bytes_per_sample = 2  # 16-bit PCM is 2 bytes per sample
-    samples_per_frame = int(sample_rate * frame_duration_ms / 1000)
-    bytes_per_frame = samples_per_frame * bytes_per_sample
-    
-    logger.info(f"Chunking audio: {len(audio_data)} bytes into {bytes_per_frame}-byte frames")
+def chunk_audio_for_vad_simplified(audio_data):
+    """Simplified chunking for WebRTC VAD with correct frame sizes."""
+    # Calculate frame size based on FRAME_DURATION_MS and SAMPLE_RATE
+    # For 20ms at 8kHz with 2 bytes per sample: 8000 * 0.02 * 2 = 320 bytes
+    bytes_per_frame = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2)
     
     frames = []
     for i in range(0, len(audio_data), bytes_per_frame):
         frame = audio_data[i:i+bytes_per_frame]
         
-        # Ensure we have a full frame
+        # Only use complete frames
         if len(frame) == bytes_per_frame:
             frames.append(frame)
-        elif len(frame) > 0 and len(frame) >= bytes_per_frame * 0.75:
-            # Pad the frame if it's at least 75% complete
-            logger.debug(f"Padding frame from {len(frame)} to {bytes_per_frame} bytes")
-            frame = frame.ljust(bytes_per_frame, b'\x00')
-            frames.append(frame)
     
-    logger.info(f"Generated {len(frames)} frames from {len(audio_data)} bytes of audio data")
     return frames
 
 # Simple amplitude-based VAD as a fallback
-def simple_amplitude_vad(audio_data, threshold=500):
-    """Simple amplitude-based voice activity detection."""
+def simple_amplitude_vad(audio_data, threshold=300):
+    """Simple amplitude-based voice activity detection with lower threshold."""
     # Convert bytes to 16-bit PCM samples
     samples = []
     for i in range(0, len(audio_data), 2):
@@ -768,9 +758,8 @@ def simple_amplitude_vad(audio_data, threshold=500):
     
     return is_speech
 
-
-async def detect_voice_activity_improved(call_state, audio_chunk):
-    logger.info(f"Received audio chunk: {len(audio_chunk)} bytes")
+async def detect_voice_activity_simplified(call_state, audio_chunk):
+    """Simplified voice activity detection function."""
     try:
         # Decode base64 audio chunk
         audio_data = base64.b64decode(audio_chunk)
@@ -784,59 +773,40 @@ async def detect_voice_activity_improved(call_state, audio_chunk):
         if len(call_state.audio_buffer) > MAX_BUFFER_SIZE:
             call_state.audio_buffer = call_state.audio_buffer[-MAX_BUFFER_SIZE:]
         
-        # Prepare audio for VAD using improved function
-        pcm_audio = prepare_audio_for_vad_improved(audio_data)
-        
-        # If we got no PCM audio, try again with the cumulative buffer
-        if len(pcm_audio) == 0 and len(call_state.audio_buffer) > 0:
-            logger.info(f"Retry with cumulative buffer: {len(call_state.audio_buffer)} bytes")
-            pcm_audio = prepare_audio_for_vad_improved(bytes(call_state.audio_buffer))
+        # Convert ulaw to PCM
+        pcm_audio = prepare_audio_for_vad_simplified(audio_data)
+        logger.info(f"PCM bytes size: {len(pcm_audio)}")
         
         # Chunk the audio data into frames
-        frames = chunk_audio_for_vad_improved(pcm_audio, FRAME_DURATION_MS, SAMPLE_RATE)
-        logger.info(f"Generated {len(frames)} VAD frames")
+        frames = chunk_audio_for_vad_simplified(pcm_audio)
+        logger.info(f"Generated {len(frames)} frames from {len(pcm_audio)} bytes of audio data")
         
-        # If no frames were generated but we have data, try with simpler chunking
-        if len(frames) == 0 and len(pcm_audio) >= 480:  # 30ms at 8kHz with 2 bytes per sample = 480 bytes
-            logger.info("No frames with standard chunking, trying simple approach")
-            simple_frames = []
-            frame_size = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2)
-            for i in range(0, len(pcm_audio), frame_size):
-                if i + frame_size <= len(pcm_audio):
-                    simple_frames.append(pcm_audio[i:i+frame_size])
-            logger.info(f"Generated {len(simple_frames)} frames with simple chunking")
-            frames = simple_frames
-        
+        # Initialize speech detection variables
         is_speech = False
         speech_frames = 0
         total_frames = len(frames)
         
-        for frame in frames:
-            try:
-                # Check if frame contains speech
-                required_size = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2)
-                if len(frame) == required_size:
+        # Process each frame with WebRTC VAD
+        if total_frames > 0:
+            for frame in frames:
+                try:
                     frame_is_speech = vad.is_speech(frame, SAMPLE_RATE)
                     if frame_is_speech:
                         speech_frames += 1
                     call_state.vad_buffer.append(frame_is_speech)
                     is_speech = is_speech or frame_is_speech
                     
-                    # Keep only the last 20 frames (about 600ms)
+                    # Keep only the last 20 frames
                     if len(call_state.vad_buffer) > 20:
                         call_state.vad_buffer.pop(0)
-                else:
-                    logger.warning(f"Invalid frame size: {len(frame)} bytes, expected {required_size} bytes")
-            except Exception as e:
-                logger.error(f"VAD error on frame: {e}")
-                continue
-        
-        # If WebRTC VAD produces no results, try simple amplitude-based detection
-        if total_frames == 0:
-            logger.info("Trying simple amplitude-based VAD as fallback")
+                except Exception as e:
+                    logger.error(f"VAD error on frame: {e}")
+                    continue
+        else:
+            # If no frames, use simple amplitude-based VAD
+            logger.info("No frames generated, using simple amplitude-based VAD")
             is_speech = simple_amplitude_vad(pcm_audio)
             call_state.vad_buffer.append(is_speech)
-            # Keep only the last 20 entries
             if len(call_state.vad_buffer) > 20:
                 call_state.vad_buffer.pop(0)
             
@@ -844,18 +814,18 @@ async def detect_voice_activity_improved(call_state, audio_chunk):
                 speech_frames = 1
                 total_frames = 1
         
-        # Log detailed frame analysis
+        # Log frame analysis
         if total_frames > 0:
             logger.info(f"Frame analysis: {speech_frames}/{total_frames} frames detected as speech ({speech_frames/total_frames*100:.1f}%)")
         
-        # Calculate speech ratio in the buffer with a minimum to detect low volume speech
-        speech_ratio = max(0.05, sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer)))
+        # Calculate speech ratio in the buffer
+        speech_ratio = sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer))
         logger.info(f"Speech ratio: {speech_ratio:.3f}, is_speech_active: {call_state.is_speech_active}, buffer size: {len(call_state.vad_buffer)}")
         
         current_time = time.time()
         
-        # Detect speech start - much lower threshold for detection
-        if not call_state.is_speech_active and (speech_ratio > 0.1 or is_speech):
+        # Detect speech start - lower threshold for detection
+        if not call_state.is_speech_active and speech_ratio > 0.15:
             call_state.is_speech_active = True
             call_state.last_voice_activity = current_time
             logger.info(f"Speech detected (ratio: {speech_ratio:.2f})")
@@ -870,15 +840,15 @@ async def detect_voice_activity_improved(call_state, audio_chunk):
             call_state.speech_chunks.append(audio_data)
             
             # Reset activity timer if speech is detected
-            if speech_ratio > 0.05 or is_speech:
+            if speech_ratio > 0.1:
                 call_state.last_voice_activity = current_time
         
-        # Detect end of speech (silence for SILENCE_THRESHOLD_MS) - reduced threshold
+        # Detect end of speech (silence for SILENCE_THRESHOLD_MS)
         silence_duration = (current_time - call_state.last_voice_activity) * 1000
         if call_state.is_speech_active and silence_duration > SILENCE_THRESHOLD_MS:
             logger.info(f"End of speech detected after {silence_duration:.0f}ms of silence")
             
-            # Process the collected speech if we have enough data - lower minimum
+            # Process the collected speech if we have enough data
             if len(call_state.speech_chunks) > 2:
                 # Combine speech chunks
                 speech_content = b''.join(call_state.speech_chunks)
@@ -896,90 +866,6 @@ async def detect_voice_activity_improved(call_state, audio_chunk):
         return None
     except Exception as e:
         logger.error(f"Error in voice activity detection: {e}", exc_info=True)
-        return None
-
-
-# Voice activity detection coroutine
-async def detect_voice_activity(call_state, audio_chunk):
-    logger.info(f"Received audio chunk: {len(audio_chunk)} bytes")
-    try:
-        # Decode base64 audio chunk
-        audio_data = base64.b64decode(audio_chunk)
-        
-        
-        # Add to audio buffer
-        call_state.audio_buffer.extend(audio_data)
-        logger.info(f"Decoded audio data: {len(audio_data)} bytes")
-        
-        # Prepare audio for VAD
-        pcm_audio = prepare_audio_for_vad(audio_data)
-        frames = chunk_audio_for_vad(pcm_audio, FRAME_DURATION_MS, SAMPLE_RATE)
-        logger.info(f"Generated {len(frames)} VAD frames")
-        
-        is_speech = False
-        for frame in frames:
-            try:
-                # Check if frame contains speech
-                if len(frame) == int(SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2):  # 2 bytes per sample
-                    is_speech = vad.is_speech(frame, SAMPLE_RATE)
-                    call_state.vad_buffer.append(is_speech)
-                    
-                    # Keep only the last 20 frames (about 600ms)
-                    if len(call_state.vad_buffer) > 20:
-                        call_state.vad_buffer.pop(0)
-            except Exception as e:
-                logger.error(f"VAD error on frame: {e}")
-                continue
-        
-        # Calculate speech ratio in the buffer
-        speech_ratio = sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer))
-        # After calculating speech_ratio:
-        logger.info(f"Speech ratio: {speech_ratio:.3f}, is_speech_active: {call_state.is_speech_active}, buffer size: {len(call_state.vad_buffer)}")
-        
-        current_time = time.time()
-        
-        # Detect speech start
-        if not call_state.is_speech_active and speech_ratio > 0.2:  # Lower threshold for detection
-            call_state.is_speech_active = True
-            call_state.last_voice_activity = current_time
-            logger.info(f"Speech detected (ratio: {speech_ratio:.2f})")
-            
-            # If bot is speaking, trigger interruption
-            if call_state.is_bot_speaking:
-                call_state.should_interrupt = True
-                logger.info("User interruption detected")
-                
-        # If speech is active, add audio chunk to collection
-        if call_state.is_speech_active:
-            call_state.speech_chunks.append(audio_data)
-            
-            # Reset activity timer if speech is detected
-            if speech_ratio > 0.1:  # Even lower threshold to maintain activity
-                call_state.last_voice_activity = current_time
-        
-        # Detect end of speech (silence for SILENCE_THRESHOLD_MS)
-        silence_duration = (current_time - call_state.last_voice_activity) * 1000
-        if call_state.is_speech_active and silence_duration > SILENCE_THRESHOLD_MS:
-            logger.info(f"End of speech detected after {silence_duration:.0f}ms of silence")
-            
-            # Process the collected speech if we have enough data
-            if len(call_state.speech_chunks) > 3:  # Lower minimum chunks to process
-                # Combine speech chunks
-                speech_content = b''.join(call_state.speech_chunks)
-                
-                # Reset speech detection
-                call_state.reset_speech_detection()
-                
-                # Return the speech content for processing
-                return speech_content
-            else:
-                # Not enough speech data, reset
-                call_state.reset_speech_detection()
-                logger.info("Speech too short, ignoring")
-        
-        return None
-    except Exception as e:
-        logger.error(f"Error in voice activity detection: {e}")
         return None
 
 # WebSocket route for media-stream
@@ -1030,7 +916,7 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                 if event_type == "media":
                     # Process audio chunk for voice activity detection
                     audio_payload = message["media"]["payload"]
-                    speech_content = await detect_voice_activity_improved(call_state, audio_payload)
+                    speech_content = await detect_voice_activity_simplified(call_state, audio_payload)
                     
                     if speech_content and not call_state.is_processing:
                         # Process detected speech in background task
