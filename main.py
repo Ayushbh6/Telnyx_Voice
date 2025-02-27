@@ -726,8 +726,8 @@ def chunk_audio_for_vad_simplified(audio_data):
     return frames
 
 # Simple amplitude-based VAD as a fallback
-def simple_amplitude_vad(audio_data, threshold=200):
-    """Simple amplitude-based voice activity detection with moderate threshold."""
+def simple_amplitude_vad(audio_data, threshold=100):  # Lowered threshold from 200 to 100
+    """Simple amplitude-based voice activity detection with adjusted threshold."""
     # Convert bytes to 16-bit PCM samples
     samples = []
     for i in range(0, len(audio_data), 2):
@@ -747,16 +747,21 @@ def simple_amplitude_vad(audio_data, threshold=200):
     peak_idx = min(int(len(sorted_samples) * 0.95), len(sorted_samples) - 1)
     peak_amplitude = sorted_samples[peak_idx] if sorted_samples else 0
     
+    # Add a minimum threshold to avoid processing very quiet sounds
+    MIN_AMPLITUDE = 10  # Minimum amplitude to even consider as speech
+    
     # Determine if it's speech based on amplitude
     # Lower the requirements - either average or peak can trigger detection
-    is_speech = avg_amplitude > threshold or peak_amplitude > threshold * 1.5
+    is_speech = (avg_amplitude > threshold or peak_amplitude > threshold * 1.5) and avg_amplitude > MIN_AMPLITUDE
     
-    logger.info(f"Amplitude VAD: avg={avg_amplitude:.1f}, peak={peak_amplitude:.1f}, threshold={threshold}, is_speech={is_speech}")
+    # Only log if there's significant audio (reduces log spam)
+    if avg_amplitude > MIN_AMPLITUDE:
+        logger.info(f"Amplitude VAD: avg={avg_amplitude:.1f}, peak={peak_amplitude:.1f}, threshold={threshold}, is_speech={is_speech}")
     
     return is_speech
 
 async def detect_voice_activity_simplified(audio_chunk_base64, call_state, websocket):
-    """Improved voice activity detection with better silence handling"""
+    """Improved voice activity detection with better silence handling and self-listening prevention"""
     try:
         # Skip processing if not in listening mode
         if not call_state.listening_mode:
@@ -764,7 +769,7 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
             
         # Skip processing if bot is speaking or already processing
         if call_state.is_bot_speaking or call_state.is_processing:
-            # Check for barge-in (user interrupting the bot)
+            # Only check for barge-in when bot is speaking
             if call_state.is_bot_speaking:
                 try:
                     # Decode base64 audio chunk
@@ -774,10 +779,11 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
                     audio_for_vad = pcm_data.tobytes()
                     
                     # Check if this is a strong speech signal (potential interrupt)
-                    is_speech = simple_amplitude_vad(audio_for_vad, threshold=300)
+                    # Use a higher threshold (400) for barge-in detection to avoid false positives
+                    is_speech = simple_amplitude_vad(audio_for_vad, threshold=400)
                     
                     if is_speech and not call_state.barge_in_detected:
-                        logger.info("🔊 Potential barge-in detected")
+                        logger.info("🔊 Strong speech signal detected during bot speech - likely barge-in")
                         call_state.barge_in_detected = True
                         # Trigger barge-in handling
                         await handle_barge_in(websocket, call_state)
@@ -785,6 +791,18 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
                     logger.error(f"Barge-in detection error: {barge_error}")
             
             return None
+            
+        # Get current time to track how long we've been listening
+        current_time = time.time()
+        
+        # If we just started listening after the bot spoke, add additional time 
+        # to prevent detecting echoes of the bot's speech
+        if current_time - call_state.last_listening_log < 3:  # Within 3 seconds of starting to listen
+            # Use a higher threshold right after bot speech
+            post_bot_speech_threshold = 250
+        else:
+            # Regular threshold when we've been listening for a while
+            post_bot_speech_threshold = 100
             
         # Decode base64 audio chunk
         audio_chunk = base64.b64decode(audio_chunk_base64)
@@ -802,6 +820,14 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
         pcm_data = ulaw_to_pcm_simplified(audio_chunk)
         audio_for_vad = pcm_data.tobytes()
         
+        # First, check with simple amplitude-based VAD
+        # Use the dynamic threshold based on how recently we started listening
+        is_amplitude_speech = simple_amplitude_vad(audio_for_vad, threshold=post_bot_speech_threshold)
+        
+        # Only proceed with more expensive WebRTC VAD if amplitude check suggests speech
+        if not is_amplitude_speech and not call_state.is_speech_active:
+            return None
+            
         # Chunk audio for VAD
         frames = chunk_audio_for_vad_simplified(audio_for_vad)
         
@@ -821,16 +847,14 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
         # Calculate speech ratio
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
         
-        # Also check amplitude-based VAD as a secondary confirmation
-        is_amplitude_speech = simple_amplitude_vad(audio_for_vad, threshold=200)
+        # Detect speech with a dynamic threshold based on how long we've been listening
+        # Use a higher threshold right after the bot spoke to prevent self-detection
+        speech_ratio_threshold = 0.3 if current_time - call_state.last_listening_log < 3 else 0.2
         
-        # Detect speech with a lower threshold (20% of frames contain speech)
-        # OR use amplitude-based detection as a fallback
-        is_speech = speech_ratio >= 0.20 or is_amplitude_speech
+        # Combined decision: higher standard right after bot speech, lower once we've been listening for a while
+        is_speech = speech_ratio >= speech_ratio_threshold or (is_amplitude_speech and speech_ratio >= 0.1)
         
         # Update speech detection state
-        current_time = time.time()
-        
         # If we detect speech and we're not already in speech mode
         if is_speech and not call_state.is_speech_active:
             logger.info(f"Speech detected (ratio: {speech_ratio:.2%}, amplitude confirmed: {is_amplitude_speech})")
@@ -851,9 +875,6 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state, webso
                 call_state.last_voice_activity = current_time
             else:
                 call_state.silence_frames += 1
-            
-            # Calculate time since last voice activity
-            time_since_last_activity = current_time - call_state.last_voice_activity
             
             # Check if we've collected enough speech (at least 30 chunks, ~3 seconds)
             enough_speech = len(call_state.speech_chunks) >= 30
@@ -919,11 +940,20 @@ async def process_speech(call_state, websocket, content):
         if not text.strip():
             logger.info("No speech detected in the audio or transcription failed")
             call_state.is_processing = False
-            # Add a delay before re-enabling listening mode
-            await asyncio.sleep(1)
+            # Add a longer delay before re-enabling listening mode to avoid feedback loops
+            await asyncio.sleep(2)
             call_state.start_listening()  # Re-enable listening mode
             return
         
+        # Check for very short transcriptions which are often noise or self-listening
+        if len(text.strip()) < 3:  # Less than 3 characters
+            logger.info(f"Very short transcription detected: '{text}' - Likely noise or echo, ignoring")
+            call_state.is_processing = False
+            # Add a longer delay before re-enabling listening mode
+            await asyncio.sleep(2)
+            call_state.start_listening()  # Re-enable listening mode
+            return
+            
         logger.info(f"Transcription result: '{text}'")
         
         # Add to conversation history
@@ -968,11 +998,13 @@ async def process_speech(call_state, websocket, content):
         # Always reset processing state and re-enable listening after a delay
         call_state.is_processing = False
         
-        # Add a slightly shorter delay before re-enabling listening mode (1.5s instead of 2s)
-        # This improves the conversational flow while still avoiding self-detection
-        logger.info("Waiting 1.5 seconds before re-enabling listening mode...")
-        await asyncio.sleep(1.5)
+        # Add a longer delay before re-enabling listening mode (2.5s instead of 1.5s)
+        # This gives more time for audio playback to complete and reduces chance of self-detection
+        logger.info("Waiting 2.5 seconds before re-enabling listening mode...")
+        await asyncio.sleep(2.5)
         
+        # Reset the speech detection system completely
+        call_state.reset_speech_detection()
         call_state.start_listening()  # Re-enable listening mode
 
 # WebSocket route for media-stream with improved multi-turn handling
@@ -1016,11 +1048,13 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
         except Exception as welcome_error:
             logger.error(f"Error sending welcome message: {welcome_error}")
         finally:
-            # Wait 2 seconds before re-enabling listening to avoid picking up echoes
-            logger.info("Waiting 2 seconds before enabling listening mode...")
-            await asyncio.sleep(2)
+            # Wait 3 seconds before re-enabling listening (increased from 2s)
+            # This helps prevent the system from picking up echoes of its own welcome message
+            logger.info("Waiting 3 seconds before enabling listening mode...")
+            await asyncio.sleep(3)
             
-            # Re-enable listening after welcome message
+            # Reset everything before starting to listen
+            call_state.reset_speech_detection()
             call_state.start_listening()
             logger.info("👂 Waiting for user to speak...")
         
@@ -1040,9 +1074,22 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                         
                         # Process audio chunk for voice activity detection
                         audio_payload = message["media"]["payload"]
+                        
+                        # Skip processing if payload is empty or too small (likely silence)
+                        if not audio_payload or len(audio_payload) < 20:  # Minimum size check
+                            continue
+                            
+                        # Process the audio through VAD
                         speech_content = await detect_voice_activity_simplified(audio_payload, call_state, websocket)
                         
                         if speech_content:
+                            # Quick validation - check if speech content is non-empty and large enough
+                            if len(speech_content) < 1000:  # Less than 1KB of audio
+                                logger.info(f"Speech content too small ({len(speech_content)} bytes), likely noise - ignoring")
+                                call_state.reset_speech_detection()
+                                call_state.start_listening()
+                                continue
+                                
                             # Process detected speech directly (not in background)
                             logger.info(f"Starting speech processing ({len(speech_content)} bytes)")
                             await process_speech(call_state, websocket, speech_content)
