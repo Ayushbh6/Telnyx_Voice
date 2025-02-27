@@ -5,7 +5,7 @@ uvicorn==0.27.1
 websockets==12.0
 openai
 elevenlabs
-webrtcvad
+webrtcvad==2.0.10
 numpy
 python-multipart
 python-jose

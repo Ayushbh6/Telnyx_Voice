@@ -364,16 +364,26 @@ async def synthesize_speech(text):
             output_format="mp3_44100_128",  # We'll convert this to ulaw
         )
         
-        # Handle the generator case
-        if hasattr(audio, '__iter__') or hasattr(audio, '__next__'):
-            audio_bytes = b''
+        # Handle the generator or bytes response
+        audio_bytes = b''
+        if hasattr(audio, '__iter__') and not isinstance(audio, bytes):
+            # If it's a generator, collect all chunks
             for chunk in audio:
-                audio_bytes += chunk
-            audio = audio_bytes
+                if chunk:  # Make sure chunk is not None
+                    audio_bytes += chunk
+        elif isinstance(audio, bytes):
+            # If it's already bytes, use it directly
+            audio_bytes = audio
+        else:
+            # If it's something else, try to convert it
+            audio_bytes = bytes(audio)
+        
+        if not audio_bytes:
+            raise ValueError("No audio data received from ElevenLabs")
         
         # Save MP3 to temporary file
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-            temp_audio.write(audio)
+            temp_audio.write(audio_bytes)
             temp_audio_path = temp_audio.name
         
         # Convert to WAV (intermediate step)
@@ -405,14 +415,7 @@ async def synthesize_speech(text):
             ], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg error: {e.stderr.decode('utf-8')}")
-            # Fallback to pydub method if ffmpeg fails
-            buffer = io.BytesIO()
-            audio_segment.export(buffer, format="wav", parameters=["-acodec", "pcm_mulaw"])
-            buffer.seek(0)
-            with wave.open(buffer, 'rb') as wav:
-                ulaw_data = wav.readframes(wav.getnframes())
-                with open(ulaw_path, "wb") as ulaw_file:
-                    ulaw_file.write(ulaw_data)
+            raise
         
         # Read the ulaw file
         with open(ulaw_path, "rb") as ulaw_file:
@@ -435,25 +438,7 @@ async def synthesize_speech(text):
         return encoded_audio
     except Exception as e:
         logger.error(f"Error in speech synthesis: {e}", exc_info=True)
-        # Fallback method in case of error
-        try:
-            # Try direct pydub method
-            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio))
-            audio_segment = audio_segment.set_channels(1).set_frame_rate(8000)
-            
-            buffer = io.BytesIO()
-            audio_segment.export(buffer, format="wav", parameters=["-acodec", "pcm_mulaw"])
-            buffer.seek(0)
-            
-            with wave.open(buffer, 'rb') as wav:
-                ulaw_data = wav.readframes(wav.getnframes())
-            
-            encoded_audio = base64.b64encode(ulaw_data).decode('utf-8')
-            logger.info("Used fallback audio conversion method")
-            return encoded_audio
-        except Exception as nested_e:
-            logger.error(f"Fallback method also failed: {nested_e}")
-            return None
+        return None
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
@@ -538,7 +523,8 @@ async def detect_voice_activity(call_state, audio_chunk):
                     if len(call_state.vad_buffer) > 20:
                         call_state.vad_buffer.pop(0)
             except Exception as e:
-                logger.error(f"VAD error: {e}")
+                logger.error(f"VAD error on frame: {e}")
+                continue
         
         # Calculate speech ratio in the buffer
         speech_ratio = sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer))
@@ -546,37 +532,38 @@ async def detect_voice_activity(call_state, audio_chunk):
         current_time = time.time()
         
         # Detect speech start
-        if not call_state.is_speech_active and speech_ratio > 0.5:
+        if not call_state.is_speech_active and speech_ratio > 0.3:  # Lower threshold for detection
             call_state.is_speech_active = True
             call_state.last_voice_activity = current_time
-            logger.info("Speech detected")
+            logger.info(f"Speech detected (ratio: {speech_ratio:.2f})")
             
             # If bot is speaking, trigger interruption
             if call_state.is_bot_speaking:
                 call_state.should_interrupt = True
                 logger.info("User interruption detected")
-        
+                
         # If speech is active, add audio chunk to collection
         if call_state.is_speech_active:
             call_state.speech_chunks.append(audio_data)
             
             # Reset activity timer if speech is detected
-            if speech_ratio > 0.3:
+            if speech_ratio > 0.2:  # Even lower threshold to maintain activity
                 call_state.last_voice_activity = current_time
         
         # Detect end of speech (silence for SILENCE_THRESHOLD_MS)
-        if call_state.is_speech_active and (current_time - call_state.last_voice_activity) * 1000 > SILENCE_THRESHOLD_MS:
-            logger.info("End of speech detected")
+        silence_duration = (current_time - call_state.last_voice_activity) * 1000
+        if call_state.is_speech_active and silence_duration > SILENCE_THRESHOLD_MS:
+            logger.info(f"End of speech detected after {silence_duration:.0f}ms of silence")
             
             # Process the collected speech if we have enough data
-            if len(call_state.speech_chunks) > 5:  # Minimum number of chunks to process
+            if len(call_state.speech_chunks) > 3:  # Lower minimum chunks to process
                 # Combine speech chunks
                 speech_content = b''.join(call_state.speech_chunks)
                 
                 # Reset speech detection
                 call_state.reset_speech_detection()
                 
-                # Process the speech in a separate task
+                # Return the speech content for processing
                 return speech_content
             else:
                 # Not enough speech data, reset

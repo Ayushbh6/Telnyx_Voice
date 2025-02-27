@@ -1,7 +1,13 @@
 FROM python:3.11-slim
 
-# Install ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg
+# Install build dependencies for Python packages and ffmpeg
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    build-essential \
+    gcc \
+    python3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
