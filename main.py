@@ -663,12 +663,15 @@ async def process_speech(call_state, websocket, content):
 
 # Voice activity detection coroutine
 async def detect_voice_activity(call_state, audio_chunk):
+    logger.info(f"Received audio chunk: {len(audio_chunk)} bytes")
     try:
         # Decode base64 audio chunk
         audio_data = base64.b64decode(audio_chunk)
         
+        
         # Add to audio buffer
         call_state.audio_buffer.extend(audio_data)
+        logger.info(f"Decoded audio data: {len(audio_data)} bytes")
         
         # Prepare audio for VAD
         pcm_audio = prepare_audio_for_vad(audio_data)
@@ -695,7 +698,7 @@ async def detect_voice_activity(call_state, audio_chunk):
         current_time = time.time()
         
         # Detect speech start
-        if not call_state.is_speech_active and speech_ratio > 0.3:  # Lower threshold for detection
+        if not call_state.is_speech_active and speech_ratio > 0.2:  # Lower threshold for detection
             call_state.is_speech_active = True
             call_state.last_voice_activity = current_time
             logger.info(f"Speech detected (ratio: {speech_ratio:.2f})")
@@ -710,7 +713,7 @@ async def detect_voice_activity(call_state, audio_chunk):
             call_state.speech_chunks.append(audio_data)
             
             # Reset activity timer if speech is detected
-            if speech_ratio > 0.2:  # Even lower threshold to maintain activity
+            if speech_ratio > 0.1:  # Even lower threshold to maintain activity
                 call_state.last_voice_activity = current_time
         
         # Detect end of speech (silence for SILENCE_THRESHOLD_MS)
