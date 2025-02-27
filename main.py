@@ -5,11 +5,12 @@ import tempfile
 import base64
 import logging
 import time
-from typing import List, Dict, Any, Optional, Tuple
+import subprocess
 import io
 import wave
 import struct
 import array
+from typing import List, Dict, Any, Optional, Tuple
 
 import websockets
 import webrtcvad
@@ -20,6 +21,8 @@ from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 from elevenlabs.client import ElevenLabs
 import numpy as np
+from pydub import AudioSegment
+from pydub.utils import make_chunks
 
 # Configure logging
 logging.basicConfig(
@@ -52,7 +55,7 @@ elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 vad = webrtcvad.Vad()
 vad.set_mode(3)  # Aggressiveness level (0-3), 3 is most aggressive
 
-# Replace this with your AI by DNA information
+# Company information (Replace with your full AI by DNA text)
 AI_by_DNA = """We empower organizations with Agentic AI
 AI by DNA is an Artificial Intelligence transformation
 agency that supports ambitious organizations to scale
@@ -277,7 +280,7 @@ async def incoming_call(request: Request):
             texml_response = file.read()
         
         # Use the host from the request headers or a fallback URL
-        host = headers.get("host") or os.getenv("APP_URL")
+        host = headers.get("host") or os.getenv("APP_URL", "telnyxvoice-production.up.railway.app")
         texml_response = texml_response.replace("{host}", host)
         logger.info(f"TeXML Response generated with host: {host}")
     except FileNotFoundError:
@@ -347,37 +350,110 @@ async def process_text(text, conversation_history):
         logger.error(f"Error in text processing: {e}")
         return "I apologize, but I couldn't process your request. Could you please try again?"
 
-# 3. Text-to-Speech (TTS) function
+# 3. Text-to-Speech (TTS) function with audio format conversion
 async def synthesize_speech(text):
-    """Convert text to speech using ElevenLabs"""
+    """Convert text to speech using ElevenLabs and convert to ulaw format"""
     try:
         start_time = time.time()
         
+        # Generate MP3 audio with ElevenLabs
         audio = elevenlabs_client.text_to_speech.convert(
             text=text,
             voice_id=ELEVENLABS_VOICE_ID,
             model_id=ELEVENLABS_MODEL_ID,
-            output_format="mp3_44100_128",
+            output_format="mp3_44100_128",  # We'll convert this to ulaw
         )
         
-        # Handle the generator case - read all bytes from the generator
+        # Handle the generator case
         if hasattr(audio, '__iter__') or hasattr(audio, '__next__'):
             audio_bytes = b''
             for chunk in audio:
                 audio_bytes += chunk
             audio = audio_bytes
         
+        # Save MP3 to temporary file
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+            temp_audio.write(audio)
+            temp_audio_path = temp_audio.name
+        
+        # Convert to WAV (intermediate step)
+        wav_path = temp_audio_path.replace(".mp3", ".wav")
+        
+        # Load MP3 using pydub
+        audio_segment = AudioSegment.from_mp3(temp_audio_path)
+        
+        # Convert to mono if stereo
+        if audio_segment.channels > 1:
+            audio_segment = audio_segment.set_channels(1)
+        
+        # Convert to 8kHz sample rate for ulaw
+        audio_segment = audio_segment.set_frame_rate(8000)
+        
+        # Export as WAV
+        audio_segment.export(wav_path, format="wav")
+        
+        # Convert WAV to ulaw using ffmpeg
+        ulaw_path = wav_path.replace(".wav", ".ulaw")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", 
+                "-i", wav_path, 
+                "-ar", "8000", 
+                "-ac", "1", 
+                "-acodec", "pcm_mulaw", 
+                ulaw_path
+            ], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg error: {e.stderr.decode('utf-8')}")
+            # Fallback to pydub method if ffmpeg fails
+            buffer = io.BytesIO()
+            audio_segment.export(buffer, format="wav", parameters=["-acodec", "pcm_mulaw"])
+            buffer.seek(0)
+            with wave.open(buffer, 'rb') as wav:
+                ulaw_data = wav.readframes(wav.getnframes())
+                with open(ulaw_path, "wb") as ulaw_file:
+                    ulaw_file.write(ulaw_data)
+        
+        # Read the ulaw file
+        with open(ulaw_path, "rb") as ulaw_file:
+            ulaw_data = ulaw_file.read()
+        
+        # Clean up temporary files
+        for path in [temp_audio_path, wav_path, ulaw_path]:
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {path}: {e}")
+        
         # Encode as base64
-        encoded_audio = base64.b64encode(audio).decode('utf-8')
+        encoded_audio = base64.b64encode(ulaw_data).decode('utf-8')
         
         duration = time.time() - start_time
-        logger.info(f"Speech synthesis completed in {duration:.2f}s")
+        logger.info(f"Speech synthesis and conversion completed in {duration:.2f}s")
         
         return encoded_audio
     except Exception as e:
-        logger.error(f"Error in speech synthesis: {e}")
-        return None
-
+        logger.error(f"Error in speech synthesis: {e}", exc_info=True)
+        # Fallback method in case of error
+        try:
+            # Try direct pydub method
+            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio))
+            audio_segment = audio_segment.set_channels(1).set_frame_rate(8000)
+            
+            buffer = io.BytesIO()
+            audio_segment.export(buffer, format="wav", parameters=["-acodec", "pcm_mulaw"])
+            buffer.seek(0)
+            
+            with wave.open(buffer, 'rb') as wav:
+                ulaw_data = wav.readframes(wav.getnframes())
+            
+            encoded_audio = base64.b64encode(ulaw_data).decode('utf-8')
+            logger.info("Used fallback audio conversion method")
+            return encoded_audio
+        except Exception as nested_e:
+            logger.error(f"Fallback method also failed: {nested_e}")
+            return None
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
@@ -569,6 +645,9 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                 logger.info("Stream stopped")
                 break
             
+            elif event_type == "connected":
+                logger.info("Received non-media event: connected")
+            
             else:
                 logger.info(f"Received non-media event: {event_type}")
     
@@ -579,7 +658,10 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
     finally:
         # Cancel any active tasks
         for task in call_state.active_tasks:
-            task.cancel()
+            try:
+                task.cancel()
+            except Exception as e:
+                logger.error(f"Error cancelling task: {e}")
 
 # Start the FastAPI server
 if __name__ == "__main__":
