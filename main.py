@@ -53,7 +53,7 @@ elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 # Initialize WebRTC VAD
 vad = webrtcvad.Vad()
-vad.set_mode(2)  # Aggressiveness level (0-3), 3 is most aggressive
+vad.set_mode(1)  # Aggressiveness level (0-3), 1 is less aggressive than 2
 
 # Company information (Replace with your full AI by DNA text)
 AI_by_DNA = """We empower organizations with Agentic AI
@@ -848,8 +848,8 @@ def chunk_audio_for_vad_simplified(audio_data):
     return frames
 
 # Simple amplitude-based VAD as a fallback
-def simple_amplitude_vad(audio_data, threshold=500):
-    """Simple amplitude-based voice activity detection with higher threshold."""
+def simple_amplitude_vad(audio_data, threshold=200):
+    """Simple amplitude-based voice activity detection with moderate threshold."""
     # Convert bytes to 16-bit PCM samples
     samples = []
     for i in range(0, len(audio_data), 2):
@@ -870,7 +870,8 @@ def simple_amplitude_vad(audio_data, threshold=500):
     peak_amplitude = sorted_samples[peak_idx] if sorted_samples else 0
     
     # Determine if it's speech based on amplitude
-    is_speech = avg_amplitude > threshold and peak_amplitude > threshold * 2
+    # Lower the requirements - either average or peak can trigger detection
+    is_speech = avg_amplitude > threshold or peak_amplitude > threshold * 1.5
     
     logger.info(f"Amplitude VAD: avg={avg_amplitude:.1f}, peak={peak_amplitude:.1f}, threshold={threshold}, is_speech={is_speech}")
     
@@ -922,11 +923,11 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
         
         # Also check amplitude-based VAD as a secondary confirmation
-        is_amplitude_speech = simple_amplitude_vad(audio_for_vad, threshold=500)  # Increased threshold
+        is_amplitude_speech = simple_amplitude_vad(audio_for_vad, threshold=200)
         
-        # Detect speech with a higher threshold (30% of frames contain speech)
-        # AND require amplitude confirmation for more robust detection
-        is_speech = speech_ratio >= 0.30 and is_amplitude_speech
+        # Detect speech with a lower threshold (20% of frames contain speech)
+        # OR use amplitude-based detection as a fallback
+        is_speech = speech_ratio >= 0.20 or is_amplitude_speech
         
         # Update speech detection state
         current_time = time.time()
@@ -951,9 +952,8 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
             # Calculate time since last voice activity
             time_since_last_activity = current_time - call_state.last_voice_activity
             
-            # Check if we've collected enough speech (at least 40 chunks, ~4 seconds)
-            # Increased from 30 to 40 to ensure we have enough speech
-            enough_speech = len(call_state.speech_chunks) >= 40
+            # Check if we've collected enough speech (at least 30 chunks, ~3 seconds)
+            enough_speech = len(call_state.speech_chunks) >= 30
             
             # Check if we've been silent for the threshold duration
             silence_detected = (not is_speech and 
@@ -973,7 +973,7 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
                     logger.info(f"Collected {len(call_state.speech_chunks)} chunks (~{len(call_state.speech_chunks)/10:.1f}s), processing speech")
                 
                 # Only process if we have collected a minimum amount of speech chunks
-                if len(call_state.speech_chunks) >= 20:  # At least 2 seconds of speech
+                if len(call_state.speech_chunks) >= 15:  # At least 1.5 seconds of speech
                     # Combine all collected audio chunks
                     all_speech = b''.join(call_state.speech_chunks)
                     logger.info(f"Processing {len(all_speech)} bytes of speech data")
