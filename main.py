@@ -147,13 +147,12 @@ class CallState:
         self.conversation_history = []
         self.is_bot_speaking = False
         self.is_processing = False
-        self.should_interrupt = False
         self.audio_buffer = bytearray()
-        self.vad_buffer = []
-        self.last_voice_activity = 0
-        self.is_speech_active = False
         self.speech_chunks = []
+        self.is_speech_active = False
+        self.last_voice_activity = 0
         self.active_tasks = set()
+        self.listening_mode = True  # New flag to control when we're actively listening
         
     def reset_speech_detection(self):
         self.speech_chunks = []
@@ -165,6 +164,18 @@ class CallState:
         # Limit history to last 10 exchanges
         if len(self.conversation_history) > 10:
             self.conversation_history = self.conversation_history[-10:]
+            
+    def start_listening(self):
+        """Enable listening mode to collect user speech"""
+        logger.info("Starting listening mode")
+        self.listening_mode = True
+        self.reset_speech_detection()
+        
+    def stop_listening(self):
+        """Disable listening mode while AI is processing/speaking"""
+        logger.info("Stopping listening mode")
+        self.listening_mode = False
+        self.reset_speech_detection()
 
 # Voice Activity Detection utilities
 def ulaw_to_pcm(ulaw_data):
@@ -695,6 +706,7 @@ def analyze_audio_file(file_path):
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
+    """Process speech with strict turn-taking"""
     # Mark as processing to prevent multiple parallel processing
     if call_state.is_processing:
         logger.info("Already processing speech, skipping")
@@ -711,6 +723,7 @@ async def process_speech(call_state, websocket, content):
         if not text.strip():
             logger.info("No speech detected in the audio or transcription failed")
             call_state.is_processing = False
+            call_state.start_listening()  # Re-enable listening mode
             return
         
         logger.info(f"Transcription result: '{text}'")
@@ -727,19 +740,13 @@ async def process_speech(call_state, websocket, content):
         logger.info(f"AI response: '{response_text}'")
         
         # 3. TTS - Convert response to audio
-        if call_state.should_interrupt:
-            logger.info("Processing interrupted by new speech, skipping response")
-            call_state.should_interrupt = False
-            call_state.is_processing = False
-            return
-        
         # Mark bot as speaking
         call_state.is_bot_speaking = True
         logger.info("Step 3: Converting response to speech...")
         
         audio_response = await synthesize_speech(response_text)
         
-        if audio_response and not call_state.should_interrupt:
+        if audio_response:
             # Send audio back to caller
             logger.info("Sending audio response to caller...")
             audio_message = {
@@ -751,10 +758,7 @@ async def process_speech(call_state, websocket, content):
             await websocket.send_json(audio_message)
             logger.info("Audio response sent successfully")
         else:
-            if not audio_response:
-                logger.error("Failed to synthesize speech")
-            if call_state.should_interrupt:
-                logger.info("Response interrupted by new speech")
+            logger.error("Failed to synthesize speech")
         
         # Reset speaking status
         call_state.is_bot_speaking = False
@@ -763,8 +767,9 @@ async def process_speech(call_state, websocket, content):
     except Exception as e:
         logger.error(f"Error processing speech: {e}", exc_info=True)
     finally:
-        # Always reset processing state
+        # Always reset processing state and re-enable listening
         call_state.is_processing = False
+        call_state.start_listening()  # Re-enable listening mode
 
 def ulaw_to_pcm_simplified(ulaw_data):
     """Convert G.711 ulaw data to PCM using a simplified approach."""
@@ -849,16 +854,18 @@ def simple_amplitude_vad(audio_data, threshold=300):
     return is_speech
 
 async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
-    """Simplified voice activity detection to determine if speech is present"""
+    """Simplified voice activity detection with strict turn-taking"""
     try:
-        # Decode base64 audio chunk
-        audio_chunk = base64.b64decode(audio_chunk_base64)
-        logger.debug(f"Decoded audio chunk: {len(audio_chunk)} bytes")
-        
+        # Skip processing if not in listening mode
+        if not call_state.listening_mode:
+            return None
+            
         # Skip processing if bot is speaking or already processing
         if call_state.is_bot_speaking or call_state.is_processing:
-            logger.debug("Skipping VAD: Bot is speaking or processing")
             return None
+            
+        # Decode base64 audio chunk
+        audio_chunk = base64.b64decode(audio_chunk_base64)
         
         # Add to audio buffer
         call_state.audio_buffer.extend(audio_chunk)
@@ -871,12 +878,10 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
         
         # Convert ulaw to PCM for VAD
         pcm_data = ulaw_to_pcm_simplified(audio_chunk)
-        
-        # Prepare audio for VAD
         audio_for_vad = pcm_data.tobytes()
         
         # Chunk audio for VAD
-        frames = chunk_audio_for_vad(audio_for_vad, FRAME_DURATION_MS, SAMPLE_RATE)
+        frames = chunk_audio_for_vad_simplified(audio_for_vad)
         
         # Count frames with speech
         speech_frames = 0
@@ -892,14 +897,12 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
         
         # Calculate speech ratio
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
-        logger.debug(f"Speech frames: {speech_frames}/{total_frames} ({speech_ratio:.2%})")
         
-        # Detect speech with a lower threshold (15% of frames contain speech)
-        is_speech = speech_ratio >= 0.15
+        # Detect speech with a moderate threshold (20% of frames contain speech)
+        is_speech = speech_ratio >= 0.20
         
         # Update speech detection state
         current_time = time.time()
-        time_since_last_activity = current_time - call_state.last_voice_activity
         
         # If we detect speech and we're not already in speech mode
         if is_speech and not call_state.is_speech_active:
@@ -911,12 +914,15 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
         
         # If we're in speech mode
         elif call_state.is_speech_active:
-            # Always update last activity time if we detect speech
+            # Add the chunk to our collection
+            call_state.speech_chunks.append(audio_chunk)
+            
+            # Update last activity time if we detect speech
             if is_speech:
                 call_state.last_voice_activity = current_time
             
-            # Add the chunk to our collection
-            call_state.speech_chunks.append(audio_chunk)
+            # Calculate time since last voice activity
+            time_since_last_activity = current_time - call_state.last_voice_activity
             
             # Check if we've collected enough speech (at least 30 chunks, ~3 seconds)
             enough_speech = len(call_state.speech_chunks) >= 30
@@ -934,7 +940,7 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
                 if silence_detected:
                     logger.info(f"End of speech detected after {time_since_last_activity:.2f}s of silence")
                 elif max_duration_exceeded:
-                    logger.info("Maximum speech duration exceeded (10s), forcing processing")
+                    logger.info("Maximum speech duration exceeded (10s), processing speech")
                 elif enough_speech:
                     logger.info(f"Collected {len(call_state.speech_chunks)} chunks (~{len(call_state.speech_chunks)/10:.1f}s), processing speech")
                 
@@ -942,15 +948,13 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
                 all_speech = b''.join(call_state.speech_chunks)
                 logger.info(f"Processing {len(all_speech)} bytes of speech data")
                 
-                # Reset speech detection state
-                call_state.reset_speech_detection()
+                # Stop listening while we process this speech
+                call_state.stop_listening()
                 
                 return all_speech
             
             return None
         
-        # Update last activity time
-        call_state.last_voice_activity = current_time
         return None
         
     except Exception as e:
@@ -974,6 +978,9 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
         # Add initial message to conversation history
         call_state.add_conversation_item("assistant", welcome_text)
         
+        # Temporarily disable listening while sending welcome message
+        call_state.stop_listening()
+        
         try:
             # Synthesize welcome speech
             welcome_audio = await synthesize_speech(welcome_text)
@@ -994,6 +1001,9 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                 logger.error("Failed to synthesize welcome audio")
         except Exception as welcome_error:
             logger.error(f"Error sending welcome message: {welcome_error}")
+        finally:
+            # Re-enable listening after welcome message
+            call_state.start_listening()
         
         # Process incoming messages
         while True:
@@ -1007,14 +1017,10 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                     audio_payload = message["media"]["payload"]
                     speech_content = await detect_voice_activity_simplified(audio_payload, call_state)
                     
-                    if speech_content and not call_state.is_processing:
-                        # Process detected speech in background task
-                        logger.info(f"Starting speech processing task ({len(speech_content)} bytes)")
-                        task = asyncio.create_task(
-                            process_speech(call_state, websocket, speech_content)
-                        )
-                        call_state.active_tasks.add(task)
-                        task.add_done_callback(lambda t: call_state.active_tasks.remove(t))
+                    if speech_content:
+                        # Process detected speech directly (not in background)
+                        logger.info(f"Starting speech processing ({len(speech_content)} bytes)")
+                        await process_speech(call_state, websocket, speech_content)
                 
                 elif event_type == "start":
                     stream_id = message.get("stream_id")
