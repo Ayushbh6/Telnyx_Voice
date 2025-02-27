@@ -153,6 +153,7 @@ class CallState:
         self.last_voice_activity = 0
         self.active_tasks = set()
         self.listening_mode = True  # New flag to control when we're actively listening
+        self.last_listening_log = 0  # Track when we last logged listening status
         
     def reset_speech_detection(self):
         self.speech_chunks = []
@@ -167,15 +168,24 @@ class CallState:
             
     def start_listening(self):
         """Enable listening mode to collect user speech"""
-        logger.info("Starting listening mode")
+        logger.info("🎤 STARTING LISTENING MODE - Ready for user input")
         self.listening_mode = True
         self.reset_speech_detection()
+        self.last_listening_log = time.time()
         
     def stop_listening(self):
         """Disable listening mode while AI is processing/speaking"""
-        logger.info("Stopping listening mode")
+        logger.info("🔇 STOPPING LISTENING MODE - Processing or speaking")
         self.listening_mode = False
         self.reset_speech_detection()
+        
+    def log_listening_status(self):
+        """Periodically log that we're still listening"""
+        current_time = time.time()
+        # Log every 5 seconds that we're still listening
+        if self.listening_mode and (current_time - self.last_listening_log) > 5:
+            logger.info("👂 Still listening for user input...")
+            self.last_listening_log = current_time
 
 # Voice Activity Detection utilities
 def ulaw_to_pcm(ulaw_data):
@@ -723,6 +733,8 @@ async def process_speech(call_state, websocket, content):
         if not text.strip():
             logger.info("No speech detected in the audio or transcription failed")
             call_state.is_processing = False
+            # Add a delay before re-enabling listening mode
+            await asyncio.sleep(1)
             call_state.start_listening()  # Re-enable listening mode
             return
         
@@ -767,8 +779,14 @@ async def process_speech(call_state, websocket, content):
     except Exception as e:
         logger.error(f"Error processing speech: {e}", exc_info=True)
     finally:
-        # Always reset processing state and re-enable listening
+        # Always reset processing state and re-enable listening after a delay
         call_state.is_processing = False
+        
+        # Add a 2-second delay before re-enabling listening mode
+        # This helps prevent the bot from picking up its own speech or echoes
+        logger.info("Waiting 2 seconds before re-enabling listening mode...")
+        await asyncio.sleep(2)
+        
         call_state.start_listening()  # Re-enable listening mode
 
 def ulaw_to_pcm_simplified(ulaw_data):
@@ -830,8 +848,8 @@ def chunk_audio_for_vad_simplified(audio_data):
     return frames
 
 # Simple amplitude-based VAD as a fallback
-def simple_amplitude_vad(audio_data, threshold=300):
-    """Simple amplitude-based voice activity detection with lower threshold."""
+def simple_amplitude_vad(audio_data, threshold=500):
+    """Simple amplitude-based voice activity detection with higher threshold."""
     # Convert bytes to 16-bit PCM samples
     samples = []
     for i in range(0, len(audio_data), 2):
@@ -846,10 +864,15 @@ def simple_amplitude_vad(audio_data, threshold=300):
     # Calculate average amplitude
     avg_amplitude = sum(samples) / len(samples)
     
-    # Determine if it's speech based on amplitude
-    is_speech = avg_amplitude > threshold
+    # Calculate peak amplitude (95th percentile to avoid outliers)
+    sorted_samples = sorted(samples)
+    peak_idx = min(int(len(sorted_samples) * 0.95), len(sorted_samples) - 1)
+    peak_amplitude = sorted_samples[peak_idx] if sorted_samples else 0
     
-    logger.info(f"Simple VAD: avg amplitude = {avg_amplitude:.1f}, threshold = {threshold}, is_speech = {is_speech}")
+    # Determine if it's speech based on amplitude
+    is_speech = avg_amplitude > threshold and peak_amplitude > threshold * 2
+    
+    logger.info(f"Amplitude VAD: avg={avg_amplitude:.1f}, peak={peak_amplitude:.1f}, threshold={threshold}, is_speech={is_speech}")
     
     return is_speech
 
@@ -898,15 +921,19 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
         # Calculate speech ratio
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
         
-        # Detect speech with a moderate threshold (20% of frames contain speech)
-        is_speech = speech_ratio >= 0.20
+        # Also check amplitude-based VAD as a secondary confirmation
+        is_amplitude_speech = simple_amplitude_vad(audio_for_vad, threshold=500)  # Increased threshold
+        
+        # Detect speech with a higher threshold (30% of frames contain speech)
+        # AND require amplitude confirmation for more robust detection
+        is_speech = speech_ratio >= 0.30 and is_amplitude_speech
         
         # Update speech detection state
         current_time = time.time()
         
         # If we detect speech and we're not already in speech mode
         if is_speech and not call_state.is_speech_active:
-            logger.info(f"Speech detected (ratio: {speech_ratio:.2%})")
+            logger.info(f"Speech detected (ratio: {speech_ratio:.2%}, amplitude confirmed: {is_amplitude_speech})")
             call_state.is_speech_active = True
             call_state.last_voice_activity = current_time
             call_state.speech_chunks.append(audio_chunk)
@@ -924,8 +951,9 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
             # Calculate time since last voice activity
             time_since_last_activity = current_time - call_state.last_voice_activity
             
-            # Check if we've collected enough speech (at least 30 chunks, ~3 seconds)
-            enough_speech = len(call_state.speech_chunks) >= 30
+            # Check if we've collected enough speech (at least 40 chunks, ~4 seconds)
+            # Increased from 30 to 40 to ensure we have enough speech
+            enough_speech = len(call_state.speech_chunks) >= 40
             
             # Check if we've been silent for the threshold duration
             silence_detected = (not is_speech and 
@@ -944,14 +972,20 @@ async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
                 elif enough_speech:
                     logger.info(f"Collected {len(call_state.speech_chunks)} chunks (~{len(call_state.speech_chunks)/10:.1f}s), processing speech")
                 
-                # Combine all collected audio chunks
-                all_speech = b''.join(call_state.speech_chunks)
-                logger.info(f"Processing {len(all_speech)} bytes of speech data")
-                
-                # Stop listening while we process this speech
-                call_state.stop_listening()
-                
-                return all_speech
+                # Only process if we have collected a minimum amount of speech chunks
+                if len(call_state.speech_chunks) >= 20:  # At least 2 seconds of speech
+                    # Combine all collected audio chunks
+                    all_speech = b''.join(call_state.speech_chunks)
+                    logger.info(f"Processing {len(all_speech)} bytes of speech data")
+                    
+                    # Stop listening while we process this speech
+                    call_state.stop_listening()
+                    
+                    return all_speech
+                else:
+                    # Not enough speech to process, likely a false positive
+                    logger.info(f"Discarding {len(call_state.speech_chunks)} chunks as likely false positive")
+                    call_state.reset_speech_detection()
             
             return None
         
@@ -1002,43 +1036,62 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
         except Exception as welcome_error:
             logger.error(f"Error sending welcome message: {welcome_error}")
         finally:
+            # Wait 3 seconds before re-enabling listening to avoid picking up echoes
+            logger.info("Waiting 3 seconds before enabling listening mode...")
+            await asyncio.sleep(3)
+            
             # Re-enable listening after welcome message
             call_state.start_listening()
+            logger.info("👂 Waiting for user to speak...")
         
         # Process incoming messages
         while True:
             try:
-                data = await websocket.receive_text()
-                message = json.loads(data)
-                event_type = message.get("event")
-                
-                if event_type == "media":
-                    # Process audio chunk for voice activity detection
-                    audio_payload = message["media"]["payload"]
-                    speech_content = await detect_voice_activity_simplified(audio_payload, call_state)
+                # Set a timeout for receiving messages to allow for periodic status updates
+                try:
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
                     
-                    if speech_content:
-                        # Process detected speech directly (not in background)
-                        logger.info(f"Starting speech processing ({len(speech_content)} bytes)")
-                        await process_speech(call_state, websocket, speech_content)
+                    message = json.loads(data)
+                    event_type = message.get("event")
+                    
+                    if event_type == "media":
+                        # Log listening status periodically
+                        call_state.log_listening_status()
+                        
+                        # Process audio chunk for voice activity detection
+                        audio_payload = message["media"]["payload"]
+                        speech_content = await detect_voice_activity_simplified(audio_payload, call_state)
+                        
+                        if speech_content:
+                            # Process detected speech directly (not in background)
+                            logger.info(f"Starting speech processing ({len(speech_content)} bytes)")
+                            await process_speech(call_state, websocket, speech_content)
+                    
+                    elif event_type == "start":
+                        stream_id = message.get("stream_id")
+                        logger.info(f"Incoming stream started: {stream_id}")
+                    
+                    elif event_type == "stop":
+                        logger.info("Stream stopped")
+                        break
+                    
+                    elif event_type == "connected":
+                        logger.info("Received non-media event: connected")
+                    
+                    else:
+                        logger.info(f"Received non-media event: {event_type}")
                 
-                elif event_type == "start":
-                    stream_id = message.get("stream_id")
-                    logger.info(f"Incoming stream started: {stream_id}")
-                
-                elif event_type == "stop":
-                    logger.info("Stream stopped")
-                    break
-                
-                elif event_type == "connected":
-                    logger.info("Received non-media event: connected")
-                
-                else:
-                    logger.info(f"Received non-media event: {event_type}")
+                except asyncio.TimeoutError:
+                    # This is expected - use this opportunity to log status
+                    call_state.log_listening_status()
+                    continue
                     
             except json.JSONDecodeError as json_error:
                 logger.error(f"JSON decode error: {json_error} - Data: {data[:100]}...")
                 continue
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected")
+                break
             except Exception as msg_error:
                 logger.error(f"Error processing message: {msg_error}")
                 continue
