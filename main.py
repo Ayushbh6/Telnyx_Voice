@@ -360,8 +360,14 @@ async def synthesize_speech(text):
             output_format="mp3_44100_128",
         )
         
-        # In a production environment, we should convert this to ulaw
-        # For now, we'll just encode as base64
+        # Handle the generator case - read all bytes from the generator
+        if hasattr(audio, '__iter__') or hasattr(audio, '__next__'):
+            audio_bytes = b''
+            for chunk in audio:
+                audio_bytes += chunk
+            audio = audio_bytes
+        
+        # Encode as base64
         encoded_audio = base64.b64encode(audio).decode('utf-8')
         
         duration = time.time() - start_time
@@ -371,6 +377,7 @@ async def synthesize_speech(text):
     except Exception as e:
         logger.error(f"Error in speech synthesis: {e}")
         return None
+
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
