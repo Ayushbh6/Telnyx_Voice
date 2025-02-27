@@ -386,9 +386,6 @@ async def synthesize_speech(text):
             temp_audio.write(audio_bytes)
             temp_audio_path = temp_audio.name
         
-        # Convert to WAV (intermediate step)
-        wav_path = temp_audio_path.replace(".mp3", ".wav")
-        
         # Load MP3 using pydub
         audio_segment = AudioSegment.from_mp3(temp_audio_path)
         
@@ -399,36 +396,78 @@ async def synthesize_speech(text):
         # Convert to 8kHz sample rate for ulaw
         audio_segment = audio_segment.set_frame_rate(8000)
         
-        # Export as WAV
-        audio_segment.export(wav_path, format="wav")
+        # Method 1: Try using ffmpeg with wav format first, then convert to ulaw
+        ulaw_data = None
         
-        # Convert WAV to ulaw using ffmpeg
-        ulaw_path = wav_path.replace(".wav", ".ulaw")
         try:
+            # Export as temporary WAV file
+            wav_path = temp_audio_path.replace(".mp3", ".wav")
+            audio_segment.export(wav_path, format="wav")
+            
+            # Use ffmpeg to convert WAV to raw u-law format (no .ulaw extension)
+            raw_path = temp_audio_path.replace(".mp3", ".raw")
+            
             subprocess.run([
-                "ffmpeg", "-y", 
-                "-i", wav_path, 
-                "-ar", "8000", 
-                "-ac", "1", 
-                "-acodec", "pcm_mulaw", 
-                ulaw_path
+                "ffmpeg", "-y",
+                "-i", wav_path,
+                "-ar", "8000",
+                "-ac", "1",
+                "-acodec", "pcm_mulaw",
+                "-f", "mulaw",  # Force mulaw format
+                raw_path
             ], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg error: {e.stderr.decode('utf-8')}")
-            raise
+            
+            # Read the raw u-law data
+            with open(raw_path, "rb") as raw_file:
+                ulaw_data = raw_file.read()
+                
+            # Clean up temporary files
+            for path in [temp_audio_path, wav_path, raw_path]:
+                if os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete temporary file {path}: {e}")
+                        
+        except Exception as e:
+            logger.warning(f"First conversion method failed: {e}")
+            
+            # Method 2: Use pydub's internal export methods as fallback
+            try:
+                # Clean up any temporary files from failed attempts
+                for path in [temp_audio_path, temp_audio_path.replace(".mp3", ".wav"), temp_audio_path.replace(".mp3", ".raw")]:
+                    if os.path.exists(path):
+                        try:
+                            os.unlink(path)
+                        except Exception:
+                            pass
+                
+                # Create a new audio segment with the right format
+                processed_segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+                processed_segment = processed_segment.set_channels(1).set_frame_rate(8000)
+                
+                # Export directly to WAV with u-law encoding
+                wav_buffer = io.BytesIO()
+                processed_segment.export(
+                    wav_buffer,
+                    format="wav",
+                    parameters=["-acodec", "pcm_mulaw"]
+                )
+                wav_buffer.seek(0)
+                
+                # Extract the raw PCM data from the WAV file
+                with wave.open(wav_buffer, "rb") as wav_file:
+                    ulaw_data = wav_file.readframes(wav_file.getnframes())
+                
+                logger.info("Used fallback conversion method successfully")
+                
+            except Exception as fallback_error:
+                logger.error(f"Fallback conversion also failed: {fallback_error}")
+                raise
         
-        # Read the ulaw file
-        with open(ulaw_path, "rb") as ulaw_file:
-            ulaw_data = ulaw_file.read()
-        
-        # Clean up temporary files
-        for path in [temp_audio_path, wav_path, ulaw_path]:
-            if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete temporary file {path}: {e}")
-        
+        if not ulaw_data or len(ulaw_data) == 0:
+            raise ValueError("No audio data after conversion")
+            
         # Encode as base64
         encoded_audio = base64.b64encode(ulaw_data).decode('utf-8')
         
@@ -438,7 +477,131 @@ async def synthesize_speech(text):
         return encoded_audio
     except Exception as e:
         logger.error(f"Error in speech synthesis: {e}", exc_info=True)
-        return None
+        
+        # Method 3: Last resort fallback - directly convert using wave module
+        try:
+            logger.info("Attempting last resort conversion method")
+            
+            # Create a new audio segment with the right format
+            processed_segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+            processed_segment = processed_segment.set_channels(1).set_frame_rate(8000)
+            
+            # Convert to PCM first
+            pcm_buffer = io.BytesIO()
+            processed_segment.export(pcm_buffer, format="wav")
+            pcm_buffer.seek(0)
+            
+            # Read PCM data
+            with wave.open(pcm_buffer, "rb") as wav_file:
+                pcm_data = wav_file.readframes(wav_file.getnframes())
+                
+            # Manual conversion to ulaw
+            ulaw_data = convert_pcm_to_ulaw(pcm_data)
+            encoded_audio = base64.b64encode(ulaw_data).decode('utf-8')
+            
+            logger.info("Last resort conversion successful")
+            return encoded_audio
+            
+        except Exception as last_error:
+            logger.error(f"All conversion methods failed: {last_error}")
+            return None
+
+def convert_pcm_to_ulaw(pcm_data):
+    """Manually convert PCM data to u-law format"""
+    # Convert PCM bytes to 16-bit signed integers
+    samples = []
+    for i in range(0, len(pcm_data), 2):
+        if i + 1 < len(pcm_data):
+            sample = struct.unpack('<h', pcm_data[i:i+2])[0]
+            samples.append(sample)
+    
+    # Convert to u-law
+    ulaw_data = bytearray()
+    for sample in samples:
+        # Clip to 16 bits
+        sample = max(-32768, min(32767, sample))
+        
+        # Apply u-law encoding algorithm
+        if sample < 0:
+            sign = 0x80
+            sample = -sample
+        else:
+            sign = 0x00
+        
+        # Add bias to avoid taking log of zero
+        sample = sample + 132
+        
+        # Convert to logarithmic scale and quantize
+        if sample > 32767:
+            sample = 32767
+        
+        # Determine the segment and mantissa
+        segment = 7
+        for i in range(7):
+            if sample <= 16383 >> i:
+                segment = i
+                break
+        
+        # Combine the sign, segment, and mantissa
+        mantissa = (sample >> (segment + 3)) & 0x0F
+        value = ~(sign | (segment << 4) | mantissa) & 0xFF
+        
+        ulaw_data.append(value)
+    
+    return bytes(ulaw_data)
+
+def analyze_audio_file(file_path):
+    """Analyze an audio file and log its properties for debugging"""
+    try:
+        if not os.path.exists(file_path):
+            logger.error(f"File does not exist: {file_path}")
+            return
+            
+        file_size = os.path.getsize(file_path)
+        logger.info(f"File size: {file_size} bytes")
+        
+        # Detect file type based on extension
+        if file_path.endswith('.mp3'):
+            try:
+                audio = AudioSegment.from_mp3(file_path)
+                logger.info(f"MP3 properties: channels={audio.channels}, sample_rate={audio.frame_rate}, "
+                           f"sample_width={audio.sample_width}, duration={len(audio)/1000}s")
+            except Exception as e:
+                logger.error(f"Failed to analyze MP3: {e}")
+        
+        elif file_path.endswith('.wav'):
+            try:
+                with wave.open(file_path, 'rb') as wav:
+                    channels = wav.getnchannels()
+                    sample_width = wav.getsampwidth()
+                    frame_rate = wav.getframerate()
+                    n_frames = wav.getnframes()
+                    duration = n_frames / frame_rate
+                    
+                    logger.info(f"WAV properties: channels={channels}, sample_rate={frame_rate}, "
+                               f"sample_width={sample_width}, frames={n_frames}, duration={duration}s")
+            except Exception as e:
+                logger.error(f"Failed to analyze WAV: {e}")
+        
+        # Try using ffprobe for any audio file
+        try:
+            cmd = [
+                "ffprobe", 
+                "-v", "error", 
+                "-show_entries", "stream=codec_name,channels,sample_rate,bit_rate", 
+                "-of", "default=noprint_wrappers=1:nokey=1", 
+                file_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode == 0 and result.stdout:
+                logger.info(f"FFprobe analysis: {result.stdout.strip()}")
+            else:
+                logger.warning(f"FFprobe analysis failed: {result.stderr}")
+        except Exception as e:
+            logger.error(f"FFprobe error: {e}")
+    
+    except Exception as e:
+        logger.error(f"Audio analysis error: {e}")
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
@@ -579,7 +742,7 @@ async def detect_voice_activity(call_state, audio_chunk):
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
     await websocket.accept()
-    logger.info("Client connected")
+    logger.info("Client connected to WebSocket")
     
     # Initialize call state
     call_state = CallState()
@@ -587,69 +750,91 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
     try:
         # Send welcome message
         welcome_text = "Hello, this is AI by DNA. How can I assist you today?"
+        logger.info(f"Sending welcome message: {welcome_text}")
         
         # Add initial message to conversation history
         call_state.add_conversation_item("assistant", welcome_text)
         
-        # Synthesize welcome speech
-        welcome_audio = await synthesize_speech(welcome_text)
-        
-        if welcome_audio:
-            call_state.is_bot_speaking = True
-            audio_message = {
-                "event": "media",
-                "media": {
-                    "payload": welcome_audio
+        try:
+            # Synthesize welcome speech
+            welcome_audio = await synthesize_speech(welcome_text)
+            
+            if welcome_audio:
+                logger.info("Welcome audio synthesized successfully")
+                call_state.is_bot_speaking = True
+                audio_message = {
+                    "event": "media",
+                    "media": {
+                        "payload": welcome_audio
+                    }
                 }
-            }
-            await websocket.send_json(audio_message)
-            call_state.is_bot_speaking = False
+                await websocket.send_json(audio_message)
+                logger.info("Welcome audio sent to client")
+                call_state.is_bot_speaking = False
+            else:
+                logger.error("Failed to synthesize welcome audio")
+        except Exception as welcome_error:
+            logger.error(f"Error sending welcome message: {welcome_error}")
         
         # Process incoming messages
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            event_type = message.get("event")
-            
-            if event_type == "media":
-                # Process audio chunk for voice activity detection
-                audio_payload = message["media"]["payload"]
-                speech_content = await detect_voice_activity(call_state, audio_payload)
+            try:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                event_type = message.get("event")
                 
-                if speech_content and not call_state.is_processing:
-                    # Process detected speech in background task
-                    task = asyncio.create_task(
-                        process_speech(call_state, websocket, speech_content)
-                    )
-                    call_state.active_tasks.add(task)
-                    task.add_done_callback(lambda t: call_state.active_tasks.remove(t))
-            
-            elif event_type == "start":
-                stream_id = message.get("stream_id")
-                logger.info(f"Incoming stream started: {stream_id}")
-            
-            elif event_type == "stop":
-                logger.info("Stream stopped")
-                break
-            
-            elif event_type == "connected":
-                logger.info("Received non-media event: connected")
-            
-            else:
-                logger.info(f"Received non-media event: {event_type}")
+                if event_type == "media":
+                    # Process audio chunk for voice activity detection
+                    audio_payload = message["media"]["payload"]
+                    speech_content = await detect_voice_activity(call_state, audio_payload)
+                    
+                    if speech_content and not call_state.is_processing:
+                        # Process detected speech in background task
+                        logger.info(f"Starting speech processing task ({len(speech_content)} bytes)")
+                        task = asyncio.create_task(
+                            process_speech(call_state, websocket, speech_content)
+                        )
+                        call_state.active_tasks.add(task)
+                        task.add_done_callback(lambda t: call_state.active_tasks.remove(t))
+                
+                elif event_type == "start":
+                    stream_id = message.get("stream_id")
+                    logger.info(f"Incoming stream started: {stream_id}")
+                
+                elif event_type == "stop":
+                    logger.info("Stream stopped")
+                    break
+                
+                elif event_type == "connected":
+                    logger.info("Received non-media event: connected")
+                
+                else:
+                    logger.info(f"Received non-media event: {event_type}")
+                    
+            except json.JSONDecodeError as json_error:
+                logger.error(f"JSON decode error: {json_error} - Data: {data[:100]}...")
+                continue
+            except Exception as msg_error:
+                logger.error(f"Error processing message: {msg_error}")
+                continue
     
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info("Client disconnected from WebSocket")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
         # Cancel any active tasks
         for task in call_state.active_tasks:
             try:
-                task.cancel()
+                if not task.done():
+                    task.cancel()
+                    logger.info("Cancelled active task")
             except Exception as e:
                 logger.error(f"Error cancelling task: {e}")
-
+        
+        logger.info("WebSocket connection closed")
+        
+        
 # Start the FastAPI server
 if __name__ == "__main__":
     import uvicorn
