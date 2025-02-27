@@ -294,9 +294,11 @@ async def transcribe_audio(audio_data):
     """Convert audio to text using OpenAI Whisper"""
     try:
         start_time = time.time()
+        logger.info(f"Starting transcription of {len(audio_data)} bytes of audio data")
         
         # Convert ulaw audio to PCM for better transcription
         pcm_data = ulaw_to_pcm_simplified(audio_data)
+        logger.info(f"Converted to PCM: {len(pcm_data)} samples")
         
         # Create a proper WAV file with headers
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
@@ -313,70 +315,111 @@ async def transcribe_audio(audio_data):
         logger.info(f"Created WAV file for transcription: {temp_path}")
         analyze_audio_file(temp_path)
         
-        # Transcribe audio using OpenAI Whisper
-        with open(temp_path, "rb") as audio_file:
-            try:
-                transcription = openai_client.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=audio_file,
-                    language="en"  # Specify language for better results
-                )
+        # Try to upsample to 16kHz first (Whisper works better with 16kHz)
+        mp3_path = temp_path.replace(".wav", ".mp3")
+        try:
+            logger.info("Upsampling audio to 16kHz for better transcription")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", temp_path,
+                "-ar", "16000",  # Upsample to 16kHz
+                "-ac", "1",      # Ensure mono
+                mp3_path
+            ], check=True, capture_output=True)
+            
+            # Verify the MP3 file was created
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                logger.info(f"Successfully created upsampled MP3: {mp3_path} ({os.path.getsize(mp3_path)} bytes)")
                 
-                # Clean up temporary file
-                os.unlink(temp_path)
+                # Try transcription with the upsampled file
+                with open(mp3_path, "rb") as mp3_file:
+                    logger.info("Sending upsampled audio to Whisper API")
+                    transcription = openai_client.audio.transcriptions.create(
+                        model=WHISPER_MODEL,
+                        file=mp3_file,
+                        language="en"  # Specify language for better results
+                    )
+                
+                # Clean up temporary files
+                for path in [temp_path, mp3_path]:
+                    if os.path.exists(path):
+                        os.unlink(path)
                 
                 duration = time.time() - start_time
                 logger.info(f"Transcription completed in {duration:.2f}s: {transcription.text}")
                 
                 return transcription.text
-            except Exception as whisper_error:
-                logger.error(f"Whisper transcription error: {whisper_error}")
-                
-                # If Whisper fails, try with a different format
-                logger.info("Trying alternative audio format for transcription")
-                
-                # Convert to higher quality audio format
-                try:
-                    # Use ffmpeg to convert to a higher quality format
-                    mp3_path = temp_path.replace(".wav", ".mp3")
-                    subprocess.run([
-                        "ffmpeg", "-y",
-                        "-i", temp_path,
-                        "-ar", "16000",  # Upsample to 16kHz
-                        "-ac", "1",
-                        mp3_path
-                    ], check=True, capture_output=True)
-                    
-                    # Try transcription again with the converted file
-                    with open(mp3_path, "rb") as mp3_file:
-                        transcription = openai_client.audio.transcriptions.create(
-                            model=WHISPER_MODEL,
-                            file=mp3_file,
-                            language="en"
-                        )
-                    
-                    # Clean up temporary files
-                    for path in [temp_path, mp3_path]:
-                        if os.path.exists(path):
-                            os.unlink(path)
-                    
-                    duration = time.time() - start_time
-                    logger.info(f"Alternative transcription completed in {duration:.2f}s: {transcription.text}")
-                    
-                    return transcription.text
-                except Exception as alt_error:
-                    logger.error(f"Alternative transcription also failed: {alt_error}")
-                    
-                    # Clean up any remaining temporary files
-                    for path in [temp_path, temp_path.replace(".wav", ".mp3")]:
-                        if os.path.exists(path):
-                            try:
-                                os.unlink(path)
-                            except:
-                                pass
-                    
-                    return ""
+            else:
+                logger.warning("Upsampling failed or produced empty file, falling back to original WAV")
+        except Exception as upsample_error:
+            logger.error(f"Error upsampling audio: {upsample_error}")
+            logger.info("Falling back to original WAV file")
         
+        # Fallback: Transcribe using the original WAV file
+        try:
+            with open(temp_path, "rb") as audio_file:
+                logger.info("Sending original WAV to Whisper API")
+                transcription = openai_client.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=audio_file,
+                    language="en"  # Specify language for better results
+                )
+            
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            
+            duration = time.time() - start_time
+            logger.info(f"Transcription completed in {duration:.2f}s: {transcription.text}")
+            
+            return transcription.text
+        except Exception as whisper_error:
+            logger.error(f"Whisper transcription error with WAV: {whisper_error}")
+            
+            # Last resort: Try with a different format
+            try:
+                # Convert to FLAC format
+                flac_path = temp_path.replace(".wav", ".flac")
+                logger.info("Trying FLAC format as last resort")
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", temp_path,
+                    "-ar", "16000",  # Upsample to 16kHz
+                    "-ac", "1",
+                    flac_path
+                ], check=True, capture_output=True)
+                
+                # Try transcription with FLAC
+                with open(flac_path, "rb") as flac_file:
+                    logger.info("Sending FLAC to Whisper API")
+                    transcription = openai_client.audio.transcriptions.create(
+                        model=WHISPER_MODEL,
+                        file=flac_file,
+                        language="en"
+                    )
+                
+                # Clean up temporary files
+                for path in [temp_path, flac_path]:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                
+                duration = time.time() - start_time
+                logger.info(f"FLAC transcription completed in {duration:.2f}s: {transcription.text}")
+                
+                return transcription.text
+            except Exception as flac_error:
+                logger.error(f"FLAC transcription also failed: {flac_error}")
+                
+                # Clean up any remaining temporary files
+                for path in [temp_path, mp3_path, flac_path]:
+                    if os.path.exists(path):
+                        try:
+                            os.unlink(path)
+                        except:
+                            pass
+                
+                return ""
+    
     except Exception as e:
         logger.error(f"Error in transcription: {e}", exc_info=True)
         return ""
@@ -614,57 +657,41 @@ def convert_pcm_to_ulaw(pcm_data):
     return bytes(ulaw_data)
 
 def analyze_audio_file(file_path):
-    """Analyze an audio file and log its properties for debugging"""
+    """Analyze audio file properties for debugging purposes"""
     try:
-        if not os.path.exists(file_path):
-            logger.error(f"File does not exist: {file_path}")
-            return
-            
+        # Get file size
         file_size = os.path.getsize(file_path)
-        logger.info(f"File size: {file_size} bytes")
+        logger.info(f"Audio file size: {file_size} bytes")
         
-        # Detect file type based on extension
-        if file_path.endswith('.mp3'):
-            try:
-                audio = AudioSegment.from_mp3(file_path)
-                logger.info(f"MP3 properties: channels={audio.channels}, sample_rate={audio.frame_rate}, "
-                           f"sample_width={audio.sample_width}, duration={len(audio)/1000}s")
-            except Exception as e:
-                logger.error(f"Failed to analyze MP3: {e}")
+        # Get audio properties using wave module for WAV files
+        if file_path.endswith('.wav'):
+            with wave.open(file_path, 'rb') as wav_file:
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                framerate = wav_file.getframerate()
+                n_frames = wav_file.getnframes()
+                duration = n_frames / framerate
+                
+                logger.info(f"WAV properties: {channels} channels, {sample_width*8}-bit, "
+                           f"{framerate} Hz, {n_frames} frames, {duration:.2f} seconds")
         
-        elif file_path.endswith('.wav'):
-            try:
-                with wave.open(file_path, 'rb') as wav:
-                    channels = wav.getnchannels()
-                    sample_width = wav.getsampwidth()
-                    frame_rate = wav.getframerate()
-                    n_frames = wav.getnframes()
-                    duration = n_frames / frame_rate
-                    
-                    logger.info(f"WAV properties: channels={channels}, sample_rate={frame_rate}, "
-                               f"sample_width={sample_width}, frames={n_frames}, duration={duration}s")
-            except Exception as e:
-                logger.error(f"Failed to analyze WAV: {e}")
-        
-        # Try using ffprobe for any audio file
+        # Try to get more detailed info using ffprobe
         try:
-            cmd = [
+            result = subprocess.run([
                 "ffprobe", 
                 "-v", "error", 
-                "-show_entries", "stream=codec_name,channels,sample_rate,bit_rate", 
-                "-of", "default=noprint_wrappers=1:nokey=1", 
+                "-show_entries", "format=duration,bit_rate:stream=codec_name,codec_type,sample_rate,channels", 
+                "-of", "json", 
                 file_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if result.returncode == 0 and result.stdout:
-                logger.info(f"FFprobe analysis: {result.stdout.strip()}")
-            else:
-                logger.warning(f"FFprobe analysis failed: {result.stderr}")
+            ], capture_output=True, text=True, check=True)
+            
+            info = json.loads(result.stdout)
+            logger.info(f"FFprobe analysis: {json.dumps(info, indent=2)}")
         except Exception as e:
-            logger.error(f"FFprobe error: {e}")
-    
+            logger.warning(f"FFprobe analysis failed: {e}")
+            
     except Exception as e:
-        logger.error(f"Audio analysis error: {e}")
+        logger.error(f"Error analyzing audio file: {e}")
 
 # Process speech function
 async def process_speech(call_state, websocket, content):
@@ -740,49 +767,34 @@ async def process_speech(call_state, websocket, content):
         call_state.is_processing = False
 
 def ulaw_to_pcm_simplified(ulaw_data):
-    """Convert G.711 ulaw data to PCM using a simplified lookup table approach."""
-    # Standard u-law to linear PCM lookup table
-    ulaw_to_linear = [
-        -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
-        -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
-        -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
-        -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
-        -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
-        -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
-        -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
-        -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
-        -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
-        -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
-        -876, -844, -812, -780, -748, -716, -684, -652,
-        -620, -588, -556, -524, -492, -460, -428, -396,
-        -372, -356, -340, -324, -308, -292, -276, -260,
-        -244, -228, -212, -196, -180, -164, -148, -132,
-        -120, -112, -104, -96, -88, -80, -72, -64,
-        -56, -48, -40, -32, -24, -16, -8, 0,
-        32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
-        23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
-        15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
-        11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
-        7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
-        5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
-        3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
-        2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
-        1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
-        1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
-        876, 844, 812, 780, 748, 716, 684, 652,
-        620, 588, 556, 524, 492, 460, 428, 396,
-        372, 356, 340, 324, 308, 292, 276, 260,
-        244, 228, 212, 196, 180, 164, 148, 132,
-        120, 112, 104, 96, 88, 80, 72, 64,
-        56, 48, 40, 32, 24, 16, 8, 0
-    ]
+    """Convert G.711 ulaw data to PCM using a simplified approach."""
+    # Create a numpy array to hold the PCM data
+    pcm_data = np.zeros(len(ulaw_data), dtype=np.int16)
     
-    pcm_data = array.array('h')
-    
-    for byte in ulaw_data:
-        # u-law data is bitwise inverted (one's complement) when transmitted
-        index = ~byte & 0xFF
-        pcm_data.append(ulaw_to_linear[index])
+    for i, byte in enumerate(ulaw_data):
+        # Flip all bits (bitwise NOT)
+        byte = ~byte & 0xFF
+        
+        # Extract sign bit: 1 for positive, -1 for negative
+        sign = 1 if (byte & 0x80) else -1
+        
+        # Extract position bits and calculate position
+        position = ((byte & 0x70) >> 4)
+        
+        # Extract segment bits
+        segment = (byte & 0x0F)
+        
+        # Calculate linear PCM value
+        value = segment << (position + 1)
+        
+        # Add bias
+        value += (1 << position)
+        
+        # Apply sign
+        value = value * sign
+        
+        # Store in array
+        pcm_data[i] = value
     
     return pcm_data
 
@@ -836,129 +848,111 @@ def simple_amplitude_vad(audio_data, threshold=300):
     
     return is_speech
 
-async def detect_voice_activity_simplified(call_state, audio_chunk):
-    """Simplified voice activity detection function."""
+async def detect_voice_activity_simplified(audio_chunk_base64, call_state):
+    """Simplified voice activity detection to determine if speech is present"""
     try:
         # Decode base64 audio chunk
-        audio_data = base64.b64decode(audio_chunk)
-        logger.info(f"Decoded audio data: {len(audio_data)} bytes")
+        audio_chunk = base64.b64decode(audio_chunk_base64)
+        logger.debug(f"Decoded audio chunk: {len(audio_chunk)} bytes")
+        
+        # Skip processing if bot is speaking or already processing
+        if call_state.is_bot_speaking or call_state.is_processing:
+            logger.debug("Skipping VAD: Bot is speaking or processing")
+            return None
         
         # Add to audio buffer
-        call_state.audio_buffer.extend(audio_data)
+        call_state.audio_buffer.extend(audio_chunk)
         
-        # Limit buffer size to prevent memory issues
-        MAX_BUFFER_SIZE = 1024 * 1024  # 1MB max
+        # Limit buffer size to prevent memory issues (max 1MB)
+        MAX_BUFFER_SIZE = 1024 * 1024  # 1MB
         if len(call_state.audio_buffer) > MAX_BUFFER_SIZE:
+            logger.warning(f"Audio buffer exceeded {MAX_BUFFER_SIZE} bytes, truncating")
             call_state.audio_buffer = call_state.audio_buffer[-MAX_BUFFER_SIZE:]
         
-        # Convert ulaw to PCM
-        pcm_audio = prepare_audio_for_vad_simplified(audio_data)
-        logger.info(f"PCM bytes size: {len(pcm_audio)}")
+        # Convert ulaw to PCM for VAD
+        pcm_data = ulaw_to_pcm_simplified(audio_chunk)
         
-        # Chunk the audio data into frames
-        frames = chunk_audio_for_vad_simplified(pcm_audio)
-        logger.info(f"Generated {len(frames)} frames from {len(pcm_audio)} bytes of audio data")
+        # Prepare audio for VAD
+        audio_for_vad = pcm_data.tobytes()
         
-        # Initialize speech detection variables
-        is_speech = False
+        # Chunk audio for VAD
+        frames = chunk_audio_for_vad(audio_for_vad, FRAME_DURATION_MS, SAMPLE_RATE)
+        
+        # Count frames with speech
         speech_frames = 0
         total_frames = len(frames)
         
-        # Process each frame with WebRTC VAD
-        if total_frames > 0:
-            for frame in frames:
-                try:
-                    frame_is_speech = vad.is_speech(frame, SAMPLE_RATE)
-                    if frame_is_speech:
-                        speech_frames += 1
-                    call_state.vad_buffer.append(frame_is_speech)
-                    is_speech = is_speech or frame_is_speech
-                    
-                    # Keep only the last 20 frames
-                    if len(call_state.vad_buffer) > 20:
-                        call_state.vad_buffer.pop(0)
-                except Exception as e:
-                    logger.error(f"VAD error on frame: {e}")
-                    continue
-        else:
-            # If no frames, use simple amplitude-based VAD
-            logger.info("No frames generated, using simple amplitude-based VAD")
-            is_speech = simple_amplitude_vad(pcm_audio)
-            call_state.vad_buffer.append(is_speech)
-            if len(call_state.vad_buffer) > 20:
-                call_state.vad_buffer.pop(0)
-            
-            if is_speech:
-                speech_frames = 1
-                total_frames = 1
+        for frame in frames:
+            try:
+                is_speech = vad.is_speech(frame, SAMPLE_RATE)
+                if is_speech:
+                    speech_frames += 1
+            except Exception as e:
+                logger.error(f"VAD error on frame: {e}")
         
-        # Log frame analysis
-        if total_frames > 0:
-            logger.info(f"Frame analysis: {speech_frames}/{total_frames} frames detected as speech ({speech_frames/total_frames*100:.1f}%)")
+        # Calculate speech ratio
+        speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
+        logger.debug(f"Speech frames: {speech_frames}/{total_frames} ({speech_ratio:.2%})")
         
-        # Calculate speech ratio in the buffer
-        speech_ratio = sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer))
-        logger.info(f"Speech ratio: {speech_ratio:.3f}, is_speech_active: {call_state.is_speech_active}, buffer size: {len(call_state.vad_buffer)}")
+        # Detect speech with a lower threshold (15% of frames contain speech)
+        is_speech = speech_ratio >= 0.15
         
+        # Update speech detection state
         current_time = time.time()
+        time_since_last_activity = current_time - call_state.last_voice_activity
         
-        # Detect speech start - lower threshold for detection
-        if not call_state.is_speech_active and speech_ratio > 0.15:
+        # If we detect speech and we're not already in speech mode
+        if is_speech and not call_state.is_speech_active:
+            logger.info(f"Speech detected (ratio: {speech_ratio:.2%})")
             call_state.is_speech_active = True
             call_state.last_voice_activity = current_time
-            logger.info(f"Speech detected (ratio: {speech_ratio:.2f})")
-            
-            # If bot is speaking, trigger interruption
-            if call_state.is_bot_speaking:
-                call_state.should_interrupt = True
-                logger.info("User interruption detected")
-                
-        # If speech is active, add audio chunk to collection
-        if call_state.is_speech_active:
-            call_state.speech_chunks.append(audio_data)
-            
-            # Reset activity timer if speech is detected
-            if speech_ratio > 0.1:
+            call_state.speech_chunks.append(audio_chunk)
+            return None
+        
+        # If we're in speech mode
+        elif call_state.is_speech_active:
+            # Always update last activity time if we detect speech
+            if is_speech:
                 call_state.last_voice_activity = current_time
-        
-        # Detect end of speech (silence for SILENCE_THRESHOLD_MS)
-        silence_duration = (current_time - call_state.last_voice_activity) * 1000
-        if call_state.is_speech_active and silence_duration > SILENCE_THRESHOLD_MS:
-            logger.info(f"End of speech detected after {silence_duration:.0f}ms of silence")
             
-            # Process the collected speech if we have enough data
-            if len(call_state.speech_chunks) > 2:
-                # Combine speech chunks
-                speech_content = b''.join(call_state.speech_chunks)
-                logger.info(f"Collected {len(speech_content)} bytes of speech data from {len(call_state.speech_chunks)} chunks")
+            # Add the chunk to our collection
+            call_state.speech_chunks.append(audio_chunk)
+            
+            # Check if we've collected enough speech (at least 30 chunks, ~3 seconds)
+            enough_speech = len(call_state.speech_chunks) >= 30
+            
+            # Check if we've been silent for the threshold duration
+            silence_detected = (not is_speech and 
+                               time_since_last_activity * 1000 >= SILENCE_THRESHOLD_MS)
+            
+            # Check if we've exceeded maximum speech duration (10 seconds)
+            max_duration_exceeded = len(call_state.speech_chunks) >= 100  # ~10 seconds
+            
+            # Process speech if we've detected silence after speech or exceeded max duration
+            if silence_detected or max_duration_exceeded or enough_speech:
+                # Log the reason for processing
+                if silence_detected:
+                    logger.info(f"End of speech detected after {time_since_last_activity:.2f}s of silence")
+                elif max_duration_exceeded:
+                    logger.info("Maximum speech duration exceeded (10s), forcing processing")
+                elif enough_speech:
+                    logger.info(f"Collected {len(call_state.speech_chunks)} chunks (~{len(call_state.speech_chunks)/10:.1f}s), processing speech")
                 
-                # Reset speech detection
+                # Combine all collected audio chunks
+                all_speech = b''.join(call_state.speech_chunks)
+                logger.info(f"Processing {len(all_speech)} bytes of speech data")
+                
+                # Reset speech detection state
                 call_state.reset_speech_detection()
                 
-                # Return the speech content for processing
-                return speech_content
-            else:
-                # Not enough speech data, reset
-                call_state.reset_speech_detection()
-                logger.info("Speech too short, ignoring")
+                return all_speech
+            
+            return None
         
-        # Check if we've been collecting speech for too long (force end after 10 seconds)
-        if call_state.is_speech_active and len(call_state.speech_chunks) > 0:
-            speech_duration = (current_time - call_state.last_voice_activity + silence_duration/1000) * 1000
-            if speech_duration > 10000:  # 10 seconds max
-                logger.info(f"Forcing end of speech after {speech_duration:.0f}ms (max duration reached)")
-                
-                # Combine speech chunks
-                speech_content = b''.join(call_state.speech_chunks)
-                logger.info(f"Collected {len(speech_content)} bytes of speech data from {len(call_state.speech_chunks)} chunks")
-                
-                # Reset speech detection
-                call_state.reset_speech_detection()
-                
-                # Return the speech content for processing
-                return speech_content
-        
+        # Update last activity time
+        call_state.last_voice_activity = current_time
         return None
+        
     except Exception as e:
         logger.error(f"Error in voice activity detection: {e}", exc_info=True)
         return None
@@ -1011,7 +1005,7 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                 if event_type == "media":
                     # Process audio chunk for voice activity detection
                     audio_payload = message["media"]["payload"]
-                    speech_content = await detect_voice_activity_simplified(call_state, audio_payload)
+                    speech_content = await detect_voice_activity_simplified(audio_payload, call_state)
                     
                     if speech_content and not call_state.is_processing:
                         # Process detected speech in background task
@@ -1058,10 +1052,80 @@ async def media_stream(websocket: WebSocket, background_tasks: BackgroundTasks):
                 logger.error(f"Error cancelling task: {e}")
         
         logger.info("WebSocket connection closed")
+
+def check_ffmpeg_installed():
+    """Check if ffmpeg is installed and available in the PATH"""
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info("ffmpeg is installed and available")
+            return True
+        else:
+            logger.error("ffmpeg check failed with non-zero return code")
+            return False
+    except Exception as e:
+        logger.error(f"ffmpeg is not installed or not in PATH: {e}")
+        return False
+
+def check_openai_api_key():
+    """Check if the OpenAI API key is valid by making a test request"""
+    try:
+        # Create a temporary client to test the API key
+        test_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
+        # Make a simple test request
+        response = test_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Hello, this is a test request."}],
+            max_tokens=5
+        )
         
-# Start the FastAPI server
-if __name__ == "__main__":
-    import uvicorn
+        if response and hasattr(response, 'choices') and len(response.choices) > 0:
+            logger.info("OpenAI API key is valid")
+            return True
+        else:
+            logger.error("OpenAI API key test failed: Unexpected response format")
+            return False
+    except Exception as e:
+        logger.error(f"OpenAI API key test failed: {e}")
+        return False
+
+def check_environment_variables():
+    """Check if all required environment variables are set"""
+    required_vars = {
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+        "ELEVENLABS_API_KEY": os.getenv("ELEVENLABS_API_KEY"),
+        "ELEVENLABS_VOICE_ID": os.getenv("ELEVENLABS_VOICE_ID"),
+    }
+    
+    missing_vars = [var for var, value in required_vars.items() if not value]
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        logger.error("Please set these variables in your .env file or environment")
+        return False
+    
+    logger.info("All required environment variables are set")
+    return True
+
+# Main function
+async def main():
+    """Main function to run the voice bot"""
+    # Check environment variables
+    check_environment_variables()
+    
+    # Check if ffmpeg is installed
+    check_ffmpeg_installed()
+    
+    # Check if OpenAI API key is valid
+    check_openai_api_key()
+    
+    # Start the FastAPI server
     logger.info(f"Starting server on port {PORT}")
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+# Entry point
+if __name__ == "__main__":
+    # Run the main function
+    asyncio.run(main())
