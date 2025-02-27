@@ -295,27 +295,90 @@ async def transcribe_audio(audio_data):
     try:
         start_time = time.time()
         
-        # Save audio to temporary file
+        # Convert ulaw audio to PCM for better transcription
+        pcm_data = ulaw_to_pcm_simplified(audio_data)
+        
+        # Create a proper WAV file with headers
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-            temp_audio.write(audio_data)
-            temp_audio_path = temp_audio.name
+            temp_path = temp_audio.name
+            
+            # Write WAV header and PCM data
+            with wave.open(temp_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(SAMPLE_RATE)  # 8kHz
+                wav_file.writeframes(pcm_data.tobytes())
+        
+        # Log the audio file properties for debugging
+        logger.info(f"Created WAV file for transcription: {temp_path}")
+        analyze_audio_file(temp_path)
         
         # Transcribe audio using OpenAI Whisper
-        with open(temp_audio_path, "rb") as audio_file:
-            transcription = openai_client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=audio_file
-            )
+        with open(temp_path, "rb") as audio_file:
+            try:
+                transcription = openai_client.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=audio_file,
+                    language="en"  # Specify language for better results
+                )
+                
+                # Clean up temporary file
+                os.unlink(temp_path)
+                
+                duration = time.time() - start_time
+                logger.info(f"Transcription completed in {duration:.2f}s: {transcription.text}")
+                
+                return transcription.text
+            except Exception as whisper_error:
+                logger.error(f"Whisper transcription error: {whisper_error}")
+                
+                # If Whisper fails, try with a different format
+                logger.info("Trying alternative audio format for transcription")
+                
+                # Convert to higher quality audio format
+                try:
+                    # Use ffmpeg to convert to a higher quality format
+                    mp3_path = temp_path.replace(".wav", ".mp3")
+                    subprocess.run([
+                        "ffmpeg", "-y",
+                        "-i", temp_path,
+                        "-ar", "16000",  # Upsample to 16kHz
+                        "-ac", "1",
+                        mp3_path
+                    ], check=True, capture_output=True)
+                    
+                    # Try transcription again with the converted file
+                    with open(mp3_path, "rb") as mp3_file:
+                        transcription = openai_client.audio.transcriptions.create(
+                            model=WHISPER_MODEL,
+                            file=mp3_file,
+                            language="en"
+                        )
+                    
+                    # Clean up temporary files
+                    for path in [temp_path, mp3_path]:
+                        if os.path.exists(path):
+                            os.unlink(path)
+                    
+                    duration = time.time() - start_time
+                    logger.info(f"Alternative transcription completed in {duration:.2f}s: {transcription.text}")
+                    
+                    return transcription.text
+                except Exception as alt_error:
+                    logger.error(f"Alternative transcription also failed: {alt_error}")
+                    
+                    # Clean up any remaining temporary files
+                    for path in [temp_path, temp_path.replace(".wav", ".mp3")]:
+                        if os.path.exists(path):
+                            try:
+                                os.unlink(path)
+                            except:
+                                pass
+                    
+                    return ""
         
-        # Clean up temporary file
-        os.unlink(temp_audio_path)
-        
-        duration = time.time() - start_time
-        logger.info(f"Transcription completed in {duration:.2f}s: {transcription.text}")
-        
-        return transcription.text
     except Exception as e:
-        logger.error(f"Error in transcription: {e}")
+        logger.error(f"Error in transcription: {e}", exc_info=True)
         return ""
 
 # 2. Text-to-Text (TTT) function
@@ -611,24 +674,30 @@ async def process_speech(call_state, websocket, content):
         return
     
     call_state.is_processing = True
+    logger.info(f"Starting speech processing pipeline with {len(content)} bytes of audio data")
     
     try:
         # 1. STT - Transcribe speech to text
+        logger.info("Step 1: Transcribing speech to text...")
         text = await transcribe_audio(content)
         
         if not text.strip():
-            logger.info("No speech detected in the audio")
+            logger.info("No speech detected in the audio or transcription failed")
             call_state.is_processing = False
             return
+        
+        logger.info(f"Transcription result: '{text}'")
         
         # Add to conversation history
         call_state.add_conversation_item("user", text)
         
         # 2. TTT - Process with AI
+        logger.info("Step 2: Processing text with AI...")
         response_text = await process_text(text, call_state.conversation_history)
         
         # Add AI response to conversation history
         call_state.add_conversation_item("assistant", response_text)
+        logger.info(f"AI response: '{response_text}'")
         
         # 3. TTS - Convert response to audio
         if call_state.should_interrupt:
@@ -639,11 +708,13 @@ async def process_speech(call_state, websocket, content):
         
         # Mark bot as speaking
         call_state.is_bot_speaking = True
+        logger.info("Step 3: Converting response to speech...")
         
         audio_response = await synthesize_speech(response_text)
         
         if audio_response and not call_state.should_interrupt:
             # Send audio back to caller
+            logger.info("Sending audio response to caller...")
             audio_message = {
                 "event": "media",
                 "media": {
@@ -651,12 +722,19 @@ async def process_speech(call_state, websocket, content):
                 }
             }
             await websocket.send_json(audio_message)
+            logger.info("Audio response sent successfully")
+        else:
+            if not audio_response:
+                logger.error("Failed to synthesize speech")
+            if call_state.should_interrupt:
+                logger.info("Response interrupted by new speech")
         
         # Reset speaking status
         call_state.is_bot_speaking = False
+        logger.info("Speech processing pipeline completed successfully")
         
     except Exception as e:
-        logger.error(f"Error processing speech: {e}")
+        logger.error(f"Error processing speech: {e}", exc_info=True)
     finally:
         # Always reset processing state
         call_state.is_processing = False
@@ -852,6 +930,7 @@ async def detect_voice_activity_simplified(call_state, audio_chunk):
             if len(call_state.speech_chunks) > 2:
                 # Combine speech chunks
                 speech_content = b''.join(call_state.speech_chunks)
+                logger.info(f"Collected {len(speech_content)} bytes of speech data from {len(call_state.speech_chunks)} chunks")
                 
                 # Reset speech detection
                 call_state.reset_speech_detection()
@@ -862,6 +941,22 @@ async def detect_voice_activity_simplified(call_state, audio_chunk):
                 # Not enough speech data, reset
                 call_state.reset_speech_detection()
                 logger.info("Speech too short, ignoring")
+        
+        # Check if we've been collecting speech for too long (force end after 10 seconds)
+        if call_state.is_speech_active and len(call_state.speech_chunks) > 0:
+            speech_duration = (current_time - call_state.last_voice_activity + silence_duration/1000) * 1000
+            if speech_duration > 10000:  # 10 seconds max
+                logger.info(f"Forcing end of speech after {speech_duration:.0f}ms (max duration reached)")
+                
+                # Combine speech chunks
+                speech_content = b''.join(call_state.speech_chunks)
+                logger.info(f"Collected {len(speech_content)} bytes of speech data from {len(call_state.speech_chunks)} chunks")
+                
+                # Reset speech detection
+                call_state.reset_speech_detection()
+                
+                # Return the speech content for processing
+                return speech_content
         
         return None
     except Exception as e:
