@@ -53,7 +53,7 @@ elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 # Initialize WebRTC VAD
 vad = webrtcvad.Vad()
-vad.set_mode(3)  # Aggressiveness level (0-3), 3 is most aggressive
+vad.set_mode(2)  # Aggressiveness level (0-3), 3 is most aggressive
 
 # Company information (Replace with your full AI by DNA text)
 AI_by_DNA = """We empower organizations with Agentic AI
@@ -137,7 +137,7 @@ PORT = int(os.getenv('PORT', 8080))
 
 # VAD settings
 FRAME_DURATION_MS = 30  # 30ms frames for WebRTC VAD
-SILENCE_THRESHOLD_MS = 800  # Consider silence after 800ms
+SILENCE_THRESHOLD_MS = 500  # Consider silence after 800ms
 SPEECH_THRESHOLD_MS = 100  # Consider speech after 100ms
 SAMPLE_RATE = 8000  # 8kHz for ulaw audio from Telnyx
 
@@ -676,6 +676,7 @@ async def detect_voice_activity(call_state, audio_chunk):
         # Prepare audio for VAD
         pcm_audio = prepare_audio_for_vad(audio_data)
         frames = chunk_audio_for_vad(pcm_audio, FRAME_DURATION_MS, SAMPLE_RATE)
+        logger.info(f"Generated {len(frames)} VAD frames")
         
         is_speech = False
         for frame in frames:
@@ -694,6 +695,8 @@ async def detect_voice_activity(call_state, audio_chunk):
         
         # Calculate speech ratio in the buffer
         speech_ratio = sum(call_state.vad_buffer) / max(1, len(call_state.vad_buffer))
+        # After calculating speech_ratio:
+        logger.info(f"Speech ratio: {speech_ratio:.3f}, is_speech_active: {call_state.is_speech_active}, buffer size: {len(call_state.vad_buffer)}")
         
         current_time = time.time()
         
